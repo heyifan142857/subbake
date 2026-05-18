@@ -6,10 +6,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from subbake.config import (
+    TRANSLATE_CONFIG_KEYS,
     discover_config_path,
     discover_global_config_path,
     discover_project_config_path,
     global_config_candidates,
+    load_app_config,
+    resolve_command_config,
 )
 
 
@@ -82,3 +85,22 @@ class ConfigDiscoveryTestCase(unittest.TestCase):
 
             self.assertEqual(discovered, config_path)
             self.assertEqual(candidates[0], config_path)
+
+    def test_translate_config_accepts_agent_options(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "subbake.toml"
+            config_path.write_text(
+                "[defaults]\n"
+                "agent = false\n"
+                "agent_repair_attempts = 1\n",
+                encoding="utf-8",
+            )
+
+            values, _ = resolve_command_config(
+                load_app_config(config_path),
+                profile=None,
+                allowed_keys=TRANSLATE_CONFIG_KEYS,
+            )
+
+            self.assertFalse(values["agent"])
+            self.assertEqual(values["agent_repair_attempts"], 1)

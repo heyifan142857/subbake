@@ -23,6 +23,17 @@ class BatchSnapshot:
     stage_label: str = "IDLE"
 
 
+@dataclass(slots=True)
+class AgentRepairSnapshot:
+    stage: str
+    batch_index: int
+    attempt: int
+    max_attempts: int
+    status: str
+    error: str
+    log_path: str | None = None
+
+
 class Dashboard:
     BATCH_STAGES = ("TRANSLATE_BATCH", "FINAL_REVIEW")
 
@@ -56,6 +67,7 @@ class Dashboard:
         self.batch_stage_durations = {stage: [] for stage in self.BATCH_STAGES}
         self.batch_stage_totals = {stage: 0 for stage in self.BATCH_STAGES}
         self.batch_stage_current = {stage: 0 for stage in self.BATCH_STAGES}
+        self.agent_repairs: list[AgentRepairSnapshot] = []
         self.current_stage: str | None = None
         self.current_stage_started_at: float | None = None
         self.eta_display_seconds: int | None = None
@@ -188,6 +200,31 @@ class Dashboard:
         self._reset_eta_state()
         self.refresh()
 
+    def record_agent_repair(
+        self,
+        *,
+        stage: str,
+        batch_index: int,
+        attempt: int,
+        max_attempts: int,
+        status: str,
+        error: str,
+        log_path: str | None = None,
+    ) -> None:
+        self.agent_repairs.append(
+            AgentRepairSnapshot(
+                stage=stage,
+                batch_index=batch_index,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                status=status,
+                error=error,
+                log_path=log_path,
+            )
+        )
+        self.agent_repairs = self.agent_repairs[-6:]
+        self.refresh()
+
     def refresh(self) -> None:
         self.live.refresh()
 
@@ -225,7 +262,7 @@ class Dashboard:
         batch_table.add_row("Current batch", batch_label)
         batch_table.add_row("Latency", self._batch_latency_display())
 
-        group = Group(
+        sections: list[object] = [
             Text("subbake", style="bold cyan"),
             Text(""),
             Text("Timeline", style="bold"),
@@ -234,8 +271,38 @@ class Dashboard:
             stats,
             Text("Current batch", style="bold"),
             batch_table,
-        )
+        ]
+        agent_panel = self._agent_repair_panel()
+        if agent_panel is not None:
+            sections.extend(
+                [
+                    Text("Agent repair", style="bold"),
+                    agent_panel,
+                ]
+            )
+
+        group = Group(*sections)
         return Panel(group, border_style="cyan", title="Subtitle Translation")
+
+    def _agent_repair_panel(self) -> Table | None:
+        if not self.agent_repairs:
+            return None
+        table = Table.grid(padding=(0, 2))
+        table.add_column(justify="left")
+        table.add_column(justify="right")
+        table.add_column(justify="left")
+        table.add_column(justify="left")
+        table.add_column(justify="left")
+        table.add_row("Batch", "Attempt", "Status", "Error", "Log")
+        for repair in self.agent_repairs:
+            table.add_row(
+                f"{repair.stage} {repair.batch_index}",
+                f"{repair.attempt}/{repair.max_attempts}",
+                repair.status,
+                self._truncate_display(repair.error, 48),
+                repair.log_path or "-",
+            )
+        return table
 
     def _timeline_stage_label(self, stage: str) -> str:
         if self.stage_states.get(stage) == "skipped":
@@ -473,6 +540,12 @@ class Dashboard:
         if label.startswith("FINAL_REVIEW"):
             return "FINAL_REVIEW"
         return None
+
+    def _truncate_display(self, value: str, limit: int) -> str:
+        cleaned = value.strip().replace("\n", " ")
+        if len(cleaned) <= limit:
+            return cleaned
+        return f"{cleaned[:limit]}..."
 
     def _format_duration(self, seconds: float) -> str:
         rounded = max(0, int(round(seconds)))

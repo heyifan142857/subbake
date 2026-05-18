@@ -28,13 +28,15 @@ TRANSLATE_CONFIG_KEYS = COMMON_CONFIG_KEYS | {
     "dry_run",
     "resume",
     "cache",
+    "agent",
+    "agent_repair_attempts",
     "work_dir",
     "glossary_path",
 }
 CHECK_KEY_CONFIG_KEYS = set(COMMON_CONFIG_KEYS)
 _PATH_KEYS = {"work_dir", "glossary_path"}
-_BOOL_KEYS = {"fast", "bilingual", "final_review", "dry_run", "resume", "cache"}
-_INT_KEYS = {"batch_size", "retries"}
+_BOOL_KEYS = {"fast", "bilingual", "final_review", "dry_run", "resume", "cache", "agent"}
+_INT_KEYS = {"batch_size", "retries", "agent_repair_attempts"}
 _FLOAT_KEYS = {"timeout"}
 _STRING_KEYS = (
     TRANSLATE_CONFIG_KEYS

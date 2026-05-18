@@ -147,6 +147,30 @@ class DashboardTestCase(unittest.TestCase):
         self.assertIn("[ ✓ ] VALIDATE", rendered)
         self.assertIn("[ ✓ ] FINAL_REVIEW 12/12", rendered)
 
+    def test_agent_repair_panel_shows_attempt_status_and_log_path(self) -> None:
+        console = Console(record=True, width=160)
+        dashboard = Dashboard(console=console)
+        dashboard.live.refresh = lambda: None
+
+        dashboard.record_agent_repair(
+            stage="translate",
+            batch_index=2,
+            attempt=1,
+            max_attempts=2,
+            status="running",
+            error="Line count mismatch: expected 1 lines, received 0.",
+            log_path="/tmp/agent_logs/translate_batch_0002.json",
+        )
+
+        console.print(dashboard.render())
+        rendered = console.export_text()
+
+        self.assertIn("Agent repair", rendered)
+        self.assertIn("translate 2", rendered)
+        self.assertIn("1/2", rendered)
+        self.assertIn("running", rendered)
+        self.assertIn("translate_batch_0002.json", rendered)
+
     def _duration_to_seconds(self, value: str) -> int:
         if value.endswith("s") and "m" not in value and "h" not in value:
             return int(value[:-1])

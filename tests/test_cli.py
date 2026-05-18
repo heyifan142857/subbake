@@ -1,15 +1,60 @@
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from typer.testing import CliRunner
 
 from subbake import __version__
 from subbake.app import app
+from subbake.entities import Usage
+from subbake.models.base_model import LLMBackend
 from subbake.storage import build_runtime_paths
+
+
+class CliAgentRepairBackend(LLMBackend):
+    def generate_json(self, messages: list[dict[str, str]]) -> tuple[dict, Usage]:
+        prompt = "\n".join(message["content"] for message in messages)
+        task = self._extract_between(prompt, "TASK_START", "TASK_END")
+        if task == "translate_subtitles":
+            payload = json.loads(self._extract_between(prompt, "BATCH_JSON_START", "BATCH_JSON_END"))
+            return (
+                {
+                    "lines": [
+                        {"id": item["id"], "translation": ""}
+                        for item in payload["lines"]
+                    ],
+                    "summary": "broken",
+                    "glossary_updates": [],
+                },
+                Usage(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+        if task == "agent_repair_translation":
+            payload = json.loads(self._extract_between(prompt, "AGENT_REPAIR_JSON_START", "AGENT_REPAIR_JSON_END"))
+            return (
+                {
+                    "lines": [
+                        {"id": item["id"], "translation": f"[AGENT] {item['text']}"}
+                        for item in payload["source_lines"]
+                    ],
+                    "summary": "repaired",
+                    "glossary_updates": [],
+                },
+                Usage(input_tokens=2, output_tokens=2, total_tokens=4),
+            )
+        raise RuntimeError(f"Unexpected task: {task}")
+
+    def check_credentials(self) -> tuple[bool, str]:
+        return True, "ok"
+
+    def _extract_between(self, text: str, start_marker: str, end_marker: str) -> str:
+        start_index = text.index(start_marker) + len(start_marker)
+        end_index = text.index(end_marker, start_index)
+        return text[start_index:end_index].strip()
 
 
 class CLITestCase(unittest.TestCase):
@@ -28,6 +73,7 @@ class CLITestCase(unittest.TestCase):
         self.assertIn("--output-format", output)
         self.assertIn("--provider", output)
         self.assertIn("--fast", output)
+        self.assertIn("--no-agent", output)
         self.assertIn("--target-language", output)
         self.assertIn("--config", output)
         self.assertIn("--profile", output)
@@ -213,6 +259,34 @@ class CLITestCase(unittest.TestCase):
             output = self._strip_ansi(second_result.stdout)
             self.assertIn("Reused:", output)
             self.assertIn("1 translated batch(es) from resume", output)
+
+    def test_translate_reports_agent_summary_and_log_path_when_triggered(self) -> None:
+        with self.runner.isolated_filesystem():
+            Path("clip.txt").write_text("hello\n", encoding="utf-8")
+
+            with patch("subbake.app.build_backend", return_value=CliAgentRepairBackend()):
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "translate",
+                        "clip.txt",
+                        "--provider",
+                        "mock",
+                        "--model",
+                        "mock-zh",
+                        "--no-final-review",
+                        "--retries",
+                        "0",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(Path("clip.translated.txt").read_text(encoding="utf-8"), "[AGENT] hello\n")
+            output = self._strip_ansi(result.stdout)
+            self.assertIn("Agent:", output)
+            self.assertIn("1 triggered, 1 repaired", output)
+            self.assertIn("translate batch 1", output)
+            self.assertIn("Logs:", output)
 
     def _strip_ansi(self, value: str) -> str:
         return re.sub(r"\x1b\[[0-9;]*m", "", value)

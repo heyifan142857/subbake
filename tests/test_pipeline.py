@@ -8,7 +8,7 @@ from pathlib import Path
 
 from subbake.entities import PipelineOptions, Usage
 from subbake.models import build_backend
-from subbake.models.base_model import LLMBackend
+from subbake.models.base_model import BackendErrorMetadata, BackendRequestError, LLMBackend
 from subbake.pipeline import SubtitlePipeline
 from subbake.storage import build_runtime_paths
 
@@ -73,6 +73,35 @@ class QuietDashboard:
 
     def clear_batch(self) -> None:
         return
+
+
+class RecordingDashboard(QuietDashboard):
+    def __init__(self) -> None:
+        super().__init__()
+        self.agent_events: list[dict] = []
+
+    def record_agent_repair(
+        self,
+        *,
+        stage: str,
+        batch_index: int,
+        attempt: int,
+        max_attempts: int,
+        status: str,
+        error: str,
+        log_path: str | None = None,
+    ) -> None:
+        self.agent_events.append(
+            {
+                "stage": stage,
+                "batch_index": batch_index,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "status": status,
+                "error": error,
+                "log_path": log_path,
+            }
+        )
 
 
 class ScriptedBackend(LLMBackend):
@@ -238,6 +267,123 @@ class FastModeBestEffortBackend(LLMBackend):
         start_index = text.index(start_marker) + len(start_marker)
         end_index = text.index(end_marker, start_index)
         return text[start_index:end_index].strip()
+
+
+class AgentRepairTranslationBackend(LLMBackend):
+    def __init__(self, repair_succeeds: bool = True) -> None:
+        self.repair_succeeds = repair_succeeds
+        self.tasks: list[str] = []
+
+    def generate_json(self, messages: list[dict[str, str]]) -> tuple[dict, Usage]:
+        prompt = "\n".join(message["content"] for message in messages)
+        task = self._extract_between(prompt, "TASK_START", "TASK_END")
+        self.tasks.append(task)
+        if task == "translate_subtitles":
+            payload = json.loads(self._extract_between(prompt, "BATCH_JSON_START", "BATCH_JSON_END"))
+            return (
+                {
+                    "lines": [
+                        {"id": item["id"], "translation": ""}
+                        for item in payload["lines"]
+                    ],
+                    "summary": "broken",
+                    "glossary_updates": [],
+                },
+                Usage(input_tokens=3, output_tokens=3, total_tokens=6),
+            )
+        if task == "agent_repair_translation":
+            payload = json.loads(self._extract_between(prompt, "AGENT_REPAIR_JSON_START", "AGENT_REPAIR_JSON_END"))
+            return (
+                {
+                    "lines": [
+                        {
+                            "id": item["id"],
+                            "translation": "" if not self.repair_succeeds else f"[AGENT] {item['text']}",
+                        }
+                        for item in payload["source_lines"]
+                    ],
+                    "summary": "agent repaired",
+                    "glossary_updates": [],
+                },
+                Usage(input_tokens=7, output_tokens=7, total_tokens=14),
+            )
+        raise RuntimeError(f"Unexpected task: {task}")
+
+    def check_credentials(self) -> tuple[bool, str]:
+        return True, "ok"
+
+    def _extract_between(self, text: str, start_marker: str, end_marker: str) -> str:
+        start_index = text.index(start_marker) + len(start_marker)
+        end_index = text.index(end_marker, start_index)
+        return text[start_index:end_index].strip()
+
+
+class AgentRepairReviewBackend(LLMBackend):
+    def generate_json(self, messages: list[dict[str, str]]) -> tuple[dict, Usage]:
+        prompt = "\n".join(message["content"] for message in messages)
+        task = self._extract_between(prompt, "TASK_START", "TASK_END")
+        if task == "translate_subtitles":
+            payload = json.loads(self._extract_between(prompt, "BATCH_JSON_START", "BATCH_JSON_END"))
+            return (
+                {
+                    "lines": [
+                        {"id": item["id"], "translation": f"[SCRIPTED] {item['text']}"}
+                        for item in payload["lines"]
+                    ],
+                    "summary": "translated",
+                    "glossary_updates": [],
+                },
+                Usage(input_tokens=5, output_tokens=5, total_tokens=10),
+            )
+        if task == "review_translations":
+            payload = json.loads(self._extract_between(prompt, "REVIEW_JSON_START", "REVIEW_JSON_END"))
+            return (
+                {
+                    "lines": [
+                        {"id": item["id"], "translation": ""}
+                        for item in payload["lines"]
+                    ],
+                    "review_notes": "broken",
+                },
+                Usage(input_tokens=5, output_tokens=5, total_tokens=10),
+            )
+        if task == "agent_repair_review":
+            payload = json.loads(self._extract_between(prompt, "AGENT_REPAIR_JSON_START", "AGENT_REPAIR_JSON_END"))
+            current_by_id = {
+                item["id"]: item["translation"]
+                for item in payload["current_translations"]
+            }
+            return (
+                {
+                    "lines": [
+                        {"id": item["id"], "translation": current_by_id[item["id"]]}
+                        for item in payload["source_lines"]
+                    ],
+                    "review_notes": "agent repaired",
+                },
+                Usage(input_tokens=7, output_tokens=7, total_tokens=14),
+            )
+        raise RuntimeError(f"Unexpected task: {task}")
+
+    def check_credentials(self) -> tuple[bool, str]:
+        return True, "ok"
+
+    def _extract_between(self, text: str, start_marker: str, end_marker: str) -> str:
+        start_index = text.index(start_marker) + len(start_marker)
+        end_index = text.index(end_marker, start_index)
+        return text[start_index:end_index].strip()
+
+
+class BackendRequestFailureBackend(LLMBackend):
+    def generate_json(self, messages: list[dict[str, str]]) -> tuple[dict, Usage]:
+        _ = messages
+        raise BackendRequestError(
+            "provider failed",
+            metadata=BackendErrorMetadata(provider="test", retryable=False, status_code=401),
+        )
+
+    def check_credentials(self) -> tuple[bool, str]:
+        return True, "ok"
 
 
 class PipelineTestCase(unittest.TestCase):
@@ -542,6 +688,146 @@ class PipelineTestCase(unittest.TestCase):
             self.assertEqual(len(failure["attempts"]), 2)
             self.assertEqual(failure["attempts"][0]["error"], "'str' object has no attribute 'get'")
             self.assertTrue(failure["attempts"][0]["messages"])
+
+    def test_agent_repair_is_enabled_by_default_and_continues_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_path = temp_path / "agent.txt"
+            input_path.write_text("Alpha.\n", encoding="utf-8")
+            dashboard = RecordingDashboard()
+
+            result = SubtitlePipeline(
+                backend=AgentRepairTranslationBackend(),
+                options=PipelineOptions(
+                    input_path=input_path,
+                    batch_size=1,
+                    final_review=False,
+                    retries=0,
+                    work_dir=temp_path / "runtime",
+                ),
+                dashboard=dashboard,
+            ).run()
+
+            self.assertEqual(result.output_path.read_text(encoding="utf-8"), "[AGENT] Alpha.\n")
+            self.assertEqual(len(result.agent_repairs), 1)
+            self.assertTrue(result.agent_repairs[0].success)
+            self.assertEqual(result.agent_repairs[0].stage, "translate")
+            self.assertTrue(result.agent_repairs[0].log_path.exists())
+            self.assertIn("running", [event["status"] for event in dashboard.agent_events])
+            self.assertIn("repaired", [event["status"] for event in dashboard.agent_events])
+
+            agent_log = json.loads(result.agent_repairs[0].log_path.read_text(encoding="utf-8"))
+            self.assertTrue(agent_log["success"])
+            self.assertEqual(agent_log["stage"], "translate")
+
+    def test_no_agent_keeps_original_failure_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_path = temp_path / "agent-off.txt"
+            input_path.write_text("Alpha.\n", encoding="utf-8")
+            work_dir = temp_path / "runtime"
+
+            pipeline = SubtitlePipeline(
+                backend=AgentRepairTranslationBackend(),
+                options=PipelineOptions(
+                    input_path=input_path,
+                    batch_size=1,
+                    final_review=False,
+                    retries=0,
+                    agent=False,
+                    work_dir=work_dir,
+                ),
+                dashboard=QuietDashboard(),
+            )
+
+            with self.assertRaises(RuntimeError) as context:
+                pipeline.run()
+
+            self.assertIn("Failure sample saved to:", str(context.exception))
+            self.assertEqual(pipeline.agent_repairs, [])
+            runtime = build_runtime_paths(input_path=input_path, work_dir=work_dir, glossary_path=None)
+            self.assertFalse(runtime.agent_logs_dir.exists())
+
+    def test_agent_failure_records_attempts_and_log_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_path = temp_path / "agent-fails.txt"
+            input_path.write_text("Alpha.\n", encoding="utf-8")
+            work_dir = temp_path / "runtime"
+
+            with self.assertRaises(RuntimeError) as context:
+                SubtitlePipeline(
+                    backend=AgentRepairTranslationBackend(repair_succeeds=False),
+                    options=PipelineOptions(
+                        input_path=input_path,
+                        batch_size=1,
+                        final_review=False,
+                        retries=0,
+                        agent_repair_attempts=2,
+                        work_dir=work_dir,
+                    ),
+                    dashboard=QuietDashboard(),
+                ).run()
+
+            message = str(context.exception)
+            self.assertIn("Agent repair failed after 2 attempts.", message)
+            self.assertIn("Agent log saved to:", message)
+
+            runtime = build_runtime_paths(input_path=input_path, work_dir=work_dir, glossary_path=None)
+            failure = json.loads((runtime.failures_dir / "translate_batch_0001.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(failure["agent_attempts"]), 2)
+
+            agent_log = json.loads((runtime.agent_logs_dir / "translate_batch_0001.json").read_text(encoding="utf-8"))
+            self.assertFalse(agent_log["success"])
+            self.assertEqual(len(agent_log["attempts"]), 2)
+
+    def test_backend_request_errors_do_not_trigger_agent_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_path = temp_path / "backend-error.txt"
+            input_path.write_text("Alpha.\n", encoding="utf-8")
+            work_dir = temp_path / "runtime"
+            pipeline = SubtitlePipeline(
+                backend=BackendRequestFailureBackend(),
+                options=PipelineOptions(
+                    input_path=input_path,
+                    batch_size=1,
+                    final_review=False,
+                    retries=0,
+                    work_dir=work_dir,
+                ),
+                dashboard=QuietDashboard(),
+            )
+
+            with self.assertRaises(RuntimeError):
+                pipeline.run()
+
+            self.assertEqual(pipeline.agent_repairs, [])
+            runtime = build_runtime_paths(input_path=input_path, work_dir=work_dir, glossary_path=None)
+            self.assertFalse(runtime.agent_logs_dir.exists())
+
+    def test_agent_can_repair_review_output_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_path = temp_path / "review-agent.txt"
+            input_path.write_text("Meet Alice now.\n", encoding="utf-8")
+
+            result = SubtitlePipeline(
+                backend=AgentRepairReviewBackend(),
+                options=PipelineOptions(
+                    input_path=input_path,
+                    batch_size=1,
+                    final_review=True,
+                    retries=0,
+                    work_dir=temp_path / "runtime",
+                ),
+                dashboard=QuietDashboard(),
+            ).run()
+
+            self.assertEqual(result.review_batches, 1)
+            self.assertEqual(result.output_path.read_text(encoding="utf-8"), "[SCRIPTED] Meet Alice now.\n")
+            self.assertEqual(len(result.agent_repairs), 1)
+            self.assertEqual(result.agent_repairs[0].stage, "review")
 
     def test_cache_hit_reuses_review_response_without_backend_call(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

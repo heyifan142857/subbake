@@ -49,6 +49,7 @@ Common options for `sbake translate`:
   --dry-run        Parse and plan batches without calling the model
   --resume         Resume from run_state.json when available
   --cache          Reuse cached responses and translation-memory matches
+  --no-agent       Disable default runtime agent repair for malformed model output
   --work-dir       Directory for cache / run state / failures
   --glossary-path  Path to the persistent glossary JSON file
 
@@ -147,6 +148,24 @@ def _format_reuse_summary(result: PipelineResult) -> str | None:
     return ", ".join(parts)
 
 
+def _format_agent_summary(result: PipelineResult) -> str | None:
+    if not result.agent_repairs:
+        return None
+    triggered = len(result.agent_repairs)
+    repaired = sum(1 for item in result.agent_repairs if item.success)
+    failed = triggered - repaired
+    batches = ", ".join(
+        f"{item.stage} batch {item.batch_index}"
+        for item in result.agent_repairs
+    )
+    paths = ", ".join(str(item.log_path) for item in result.agent_repairs)
+    summary = f"{triggered} triggered, {repaired} repaired"
+    if failed:
+        summary += f", {failed} failed"
+    summary += f" ({batches}). Logs: {paths}"
+    return summary
+
+
 @app.command()
 def translate(
     ctx: typer.Context,
@@ -210,6 +229,17 @@ def translate(
         "--cache/--no-cache",
         help="Reuse cached responses and translation-memory matches.",
     ),
+    agent: bool = typer.Option(
+        True,
+        "--agent/--no-agent",
+        help="Enable the default runtime agent repair for malformed model output.",
+    ),
+    agent_repair_attempts: int = typer.Option(
+        2,
+        "--agent-repair-attempts",
+        min=0,
+        help="Maximum agent repair attempts per failed batch.",
+    ),
     work_dir: Path | None = typer.Option(None, "--work-dir", file_okay=False, help="Directory for cache, run state, failures, and default glossary."),
     glossary_path: Path | None = typer.Option(None, "--glossary-path", dir_okay=False, help="Persistent glossary JSON path."),
 ) -> None:
@@ -237,6 +267,8 @@ def translate(
         dry_run = _configured_value(ctx, "dry_run", dry_run, config_values)
         resume = _configured_value(ctx, "resume", resume, config_values)
         cache = _configured_value(ctx, "cache", cache, config_values)
+        agent = _configured_value(ctx, "agent", agent, config_values)
+        agent_repair_attempts = _configured_value(ctx, "agent_repair_attempts", agent_repair_attempts, config_values)
         work_dir = _configured_value(ctx, "work_dir", work_dir, config_values)
         glossary_path = _configured_value(ctx, "glossary_path", glossary_path, config_values)
 
@@ -262,6 +294,8 @@ def translate(
             dry_run=dry_run,
             resume=resume,
             use_cache=cache,
+            agent=agent,
+            agent_repair_attempts=agent_repair_attempts,
             work_dir=work_dir,
             glossary_path=glossary_path,
         )
@@ -321,6 +355,9 @@ def translate(
     reuse_summary = _format_reuse_summary(result)
     if reuse_summary is not None:
         console.print(f"[bold green]Reused:[/bold green] {reuse_summary}")
+    agent_summary = _format_agent_summary(result)
+    if agent_summary is not None:
+        console.print(f"[bold green]Agent:[/bold green] {agent_summary}")
     config_description = format_config_selection(config_selection)
     if config_description is not None:
         console.print(f"[bold green]Config:[/bold green] {config_description}")

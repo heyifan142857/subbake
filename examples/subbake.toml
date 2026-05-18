@@ -5,6 +5,8 @@ target_language = "zh"
 batch_size = 30
 resume = true
 cache = true
+agent = true
+agent_repair_attempts = 2
 
 [profiles.chatgpt]
 provider = "openai"

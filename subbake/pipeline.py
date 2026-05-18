@@ -4,9 +4,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 from time import perf_counter
+from typing import Any
 
 from subbake.checker import ValidationError, validate_full_alignment, validate_translation_batch
 from subbake.entities import (
+    AgentRepairRecord,
     BatchPlanEntry,
     BatchTranslationResult,
     GlossaryEntry,
@@ -28,11 +30,13 @@ from subbake.models.base_model import (
 )
 from subbake.parsers import load_document, render_document
 from subbake.prompts import (
+    build_agent_repair_messages,
     build_review_messages,
     build_translation_messages,
     select_relevant_glossary,
 )
 from subbake.storage import (
+    AgentLogStore,
     BatchShardStore,
     CacheStore,
     FailureStore,
@@ -66,6 +70,17 @@ class ReviewBatchPlan:
     reasons: list[str]
 
 
+@dataclass(slots=True)
+class AgentRepairOutcome:
+    success: bool
+    usage: Usage
+    attempts: list[dict[str, Any]]
+    log_path: Path
+    error: str = ""
+    translation_result: BatchTranslationResult | None = None
+    review_result: ReviewResult | None = None
+
+
 class SubtitlePipeline:
     def __init__(self, backend: LLMBackend | None, options: PipelineOptions, dashboard: Dashboard | None = None) -> None:
         self.backend = backend
@@ -94,7 +109,9 @@ class SubtitlePipeline:
         self.failure_store = FailureStore(self.runtime_paths.failures_dir)
         self.translation_store = BatchShardStore(self.runtime_paths.translated_batches_dir)
         self.review_store = BatchShardStore(self.runtime_paths.reviewed_batches_dir)
+        self.agent_log_store = AgentLogStore(self.runtime_paths.agent_logs_dir)
         self.translation_memory: dict[str, str] = {}
+        self.agent_repairs: list[AgentRepairRecord] = []
         self.state_store: RunStateStore | None = None
         self.input_signature: dict | None = None
         self.output_format = self._resolve_output_format(options.input_path)
@@ -106,6 +123,8 @@ class SubtitlePipeline:
             raise FileNotFoundError(f"Input file not found: {input_path}")
         if self.options.batch_size <= 0:
             raise ValueError("Batch size must be greater than zero.")
+        if self.options.agent_repair_attempts < 0:
+            raise ValueError("Agent repair attempts must be zero or greater.")
 
         with self.dashboard.running():
             self.dashboard.mark_running("LOAD_FILE")
@@ -141,6 +160,7 @@ class SubtitlePipeline:
                     translation_memory_hits=0,
                     state_path=self.runtime_paths.state_path,
                     glossary_path=self.runtime_paths.glossary_path,
+                    agent_repairs=list(self.agent_repairs),
                 )
 
             resume = self._load_resume_state(total_translation_batches=len(translation_batches))
@@ -210,6 +230,7 @@ class SubtitlePipeline:
             translation_memory_hits=self.translation_memory_hits,
             state_path=self.runtime_paths.state_path,
             glossary_path=self.runtime_paths.glossary_path,
+            agent_repairs=list(self.agent_repairs),
         )
 
     def _translate_document(
@@ -421,6 +442,28 @@ class SubtitlePipeline:
                         attempt_log["split_retry"]["error_meta"] = self._error_metadata(split_exc)
                         attempt_logs.append(attempt_log)
                         if record_failure:
+                            agent_outcome = self._repair_translation_with_agent(
+                                batch_segments=pending_segments,
+                                batch_index=batch_index,
+                                last_error=split_exc,
+                                attempt_logs=attempt_logs,
+                                last_payload=payload,
+                            )
+                            if agent_outcome is not None and agent_outcome.success:
+                                if agent_outcome.translation_result is None:
+                                    raise RuntimeError("Agent repair succeeded without a translation result.")
+                                return (
+                                    BatchTranslationResult(
+                                        lines=self._merge_translation_lines(
+                                            batch_segments,
+                                            tm_matches,
+                                            agent_outcome.translation_result.lines,
+                                        ),
+                                        summary=agent_outcome.translation_result.summary,
+                                        glossary_updates=agent_outcome.translation_result.glossary_updates,
+                                    ),
+                                    agent_outcome.usage,
+                                )
                             failure_path = self.failure_store.write(
                                 stage="translate",
                                 batch_index=batch_index,
@@ -428,6 +471,7 @@ class SubtitlePipeline:
                                 batch_segments=batch_segments,
                                 messages=messages,
                                 attempts=attempt_logs,
+                                agent_attempts=agent_outcome.attempts if agent_outcome is not None else None,
                             )
                             raise RuntimeError(
                                 self._build_translation_failure_message(
@@ -436,6 +480,7 @@ class SubtitlePipeline:
                                     failure_path=failure_path,
                                     attempt_logs=attempt_logs,
                                     split_fallback=True,
+                                    agent_outcome=agent_outcome,
                                 )
                             ) from split_exc
                         raise split_exc
@@ -464,6 +509,28 @@ class SubtitlePipeline:
                 attempt_logs.append(attempt_log)
                 if attempt == attempts:
                     if record_failure:
+                        agent_outcome = self._repair_translation_with_agent(
+                            batch_segments=pending_segments,
+                            batch_index=batch_index,
+                            last_error=exc,
+                            attempt_logs=attempt_logs,
+                            last_payload=payload,
+                        )
+                        if agent_outcome is not None and agent_outcome.success:
+                            if agent_outcome.translation_result is None:
+                                raise RuntimeError("Agent repair succeeded without a translation result.")
+                            return (
+                                BatchTranslationResult(
+                                    lines=self._merge_translation_lines(
+                                        batch_segments,
+                                        tm_matches,
+                                        agent_outcome.translation_result.lines,
+                                    ),
+                                    summary=agent_outcome.translation_result.summary,
+                                    glossary_updates=agent_outcome.translation_result.glossary_updates,
+                                ),
+                                agent_outcome.usage,
+                            )
                         failure_path = self.failure_store.write(
                             stage="translate",
                             batch_index=batch_index,
@@ -471,6 +538,7 @@ class SubtitlePipeline:
                             batch_segments=batch_segments,
                             messages=messages,
                             attempts=attempt_logs,
+                            agent_attempts=agent_outcome.attempts if agent_outcome is not None else None,
                         )
                         raise RuntimeError(
                             self._build_translation_failure_message(
@@ -479,6 +547,7 @@ class SubtitlePipeline:
                                 failure_path=failure_path,
                                 attempt_logs=attempt_logs,
                                 split_fallback=False,
+                                agent_outcome=agent_outcome,
                             )
                         ) from exc
                     raise exc
@@ -667,6 +736,7 @@ class SubtitlePipeline:
         failure_path: Path,
         attempt_logs: list[dict],
         split_fallback: bool,
+        agent_outcome: AgentRepairOutcome | None = None,
     ) -> str:
         headline = f"Translation batch {batch_index} failed after {attempts} attempt"
         if attempts != 1:
@@ -682,6 +752,8 @@ class SubtitlePipeline:
             details.append(f"Last error: {detail}")
         if suggestion:
             details.append(suggestion)
+        if agent_outcome is not None:
+            details.append(self._format_agent_failure_detail(agent_outcome))
         return self._format_failure_message(
             headline=headline,
             details=details,
@@ -900,6 +972,18 @@ class SubtitlePipeline:
                     }
                 )
                 if attempt == attempts:
+                    agent_outcome = self._repair_review_with_agent(
+                        source_segments=source_segments,
+                        translated_segments=translated_segments,
+                        batch_index=batch_index,
+                        last_error=exc,
+                        attempt_logs=attempt_logs,
+                        last_payload=payload,
+                    )
+                    if agent_outcome is not None and agent_outcome.success:
+                        if agent_outcome.review_result is None:
+                            raise RuntimeError("Agent repair succeeded without a review result.")
+                        return agent_outcome.review_result, agent_outcome.usage
                     failure_path = self.failure_store.write(
                         stage="review",
                         batch_index=batch_index,
@@ -908,15 +992,370 @@ class SubtitlePipeline:
                         translated_segments=translated_segments,
                         messages=messages,
                         attempts=attempt_logs,
+                        agent_attempts=agent_outcome.attempts if agent_outcome is not None else None,
                     )
+                    details = [f"Last error: {exc}"]
+                    if agent_outcome is not None:
+                        details.append(self._format_agent_failure_detail(agent_outcome))
                     raise RuntimeError(
                         self._format_failure_message(
                             headline=f"Final review batch {batch_index} failed after {attempts} attempts",
-                            details=[f"Last error: {exc}"],
+                            details=details,
                             failure_path=failure_path,
                         )
                     ) from exc
         raise RuntimeError("Review batch retry loop ended unexpectedly.")
+
+    def _repair_translation_with_agent(
+        self,
+        *,
+        batch_segments: list[SubtitleSegment],
+        batch_index: int,
+        last_error: Exception,
+        attempt_logs: list[dict],
+        last_payload: object,
+    ) -> AgentRepairOutcome | None:
+        if not self._should_run_agent_repair(last_error, last_payload):
+            return None
+
+        max_attempts = self.options.agent_repair_attempts
+        agent_attempt_logs: list[dict[str, Any]] = []
+        total_usage = Usage()
+        log_path = self.agent_log_store.path_for("translate", batch_index)
+        repair_error: Exception = last_error
+
+        for attempt in range(1, max_attempts + 1):
+            self._record_agent_repair(
+                stage="translate",
+                batch_index=batch_index,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                status="running",
+                error=str(repair_error),
+                log_path=log_path,
+            )
+            payload: object = None
+            usage = Usage()
+            cached = False
+            messages = build_agent_repair_messages(
+                stage="translate",
+                source_segments=batch_segments,
+                target_language=self.options.target_language,
+                last_error=str(repair_error),
+                attempt_logs=attempt_logs,
+                agent_attempt_logs=agent_attempt_logs,
+            )
+            try:
+                request_hash = build_request_hash(
+                    provider=self.options.provider,
+                    model=self.options.model,
+                    stage="agent_translate_repair",
+                    messages=messages,
+                )
+                if self.options.use_cache:
+                    cached_entry = self.cache_store.load("agent_translate_repair", request_hash)
+                    if cached_entry is not None:
+                        payload, _ = cached_entry
+                        cached = True
+                        self.cache_hits += 1
+                if payload is None:
+                    payload, usage = self._require_backend().generate_json(messages)
+                    total_usage.add(usage)
+                lines = parse_translation_lines(payload.get("lines", []))  # type: ignore[union-attr]
+                validate_translation_batch(batch_segments, lines)
+                glossary_updates = parse_glossary_entries(payload.get("glossary_updates", []))  # type: ignore[union-attr]
+                result = BatchTranslationResult(
+                    lines=lines,
+                    summary=str(payload.get("summary", "")).strip(),  # type: ignore[union-attr]
+                    glossary_updates=glossary_updates,
+                )
+                if self.options.use_cache and not cached:
+                    self.cache_store.save("agent_translate_repair", request_hash, payload, usage)  # type: ignore[arg-type]
+                agent_attempt_logs.append(
+                    {
+                        "attempt": attempt,
+                        "cached": cached,
+                        "error": None,
+                        "error_meta": None,
+                        "payload": payload,
+                        "messages": messages,
+                    }
+                )
+                log_path = self.agent_log_store.write(
+                    stage="translate",
+                    batch_index=batch_index,
+                    success=True,
+                    attempts=agent_attempt_logs,
+                )
+                self.agent_repairs.append(
+                    AgentRepairRecord(
+                        stage="translate",
+                        batch_index=batch_index,
+                        attempts=attempt,
+                        success=True,
+                        log_path=log_path,
+                    )
+                )
+                self._record_agent_repair(
+                    stage="translate",
+                    batch_index=batch_index,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    status="repaired",
+                    error="",
+                    log_path=log_path,
+                )
+                return AgentRepairOutcome(
+                    success=True,
+                    usage=total_usage,
+                    attempts=agent_attempt_logs,
+                    log_path=log_path,
+                    translation_result=result,
+                )
+            except Exception as exc:
+                repair_error = exc
+                agent_attempt_logs.append(
+                    {
+                        "attempt": attempt,
+                        "cached": cached,
+                        "error": str(exc),
+                        "error_meta": self._error_metadata(exc),
+                        "payload": payload,
+                        "messages": messages,
+                    }
+                )
+                log_path = self.agent_log_store.write(
+                    stage="translate",
+                    batch_index=batch_index,
+                    success=False,
+                    attempts=agent_attempt_logs,
+                    final_error=str(exc),
+                )
+                self._record_agent_repair(
+                    stage="translate",
+                    batch_index=batch_index,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    status="failed" if attempt == max_attempts else "retrying",
+                    error=str(exc),
+                    log_path=log_path,
+                )
+
+        self.agent_repairs.append(
+            AgentRepairRecord(
+                stage="translate",
+                batch_index=batch_index,
+                attempts=max_attempts,
+                success=False,
+                log_path=log_path,
+                error=str(repair_error),
+            )
+        )
+        return AgentRepairOutcome(
+            success=False,
+            usage=total_usage,
+            attempts=agent_attempt_logs,
+            log_path=log_path,
+            error=str(repair_error),
+        )
+
+    def _repair_review_with_agent(
+        self,
+        *,
+        source_segments: list[SubtitleSegment],
+        translated_segments: list[SubtitleSegment],
+        batch_index: int,
+        last_error: Exception,
+        attempt_logs: list[dict],
+        last_payload: object,
+    ) -> AgentRepairOutcome | None:
+        if not self._should_run_agent_repair(last_error, last_payload):
+            return None
+
+        max_attempts = self.options.agent_repair_attempts
+        agent_attempt_logs: list[dict[str, Any]] = []
+        total_usage = Usage()
+        log_path = self.agent_log_store.path_for("review", batch_index)
+        repair_error: Exception = last_error
+
+        for attempt in range(1, max_attempts + 1):
+            self._record_agent_repair(
+                stage="review",
+                batch_index=batch_index,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                status="running",
+                error=str(repair_error),
+                log_path=log_path,
+            )
+            payload: object = None
+            usage = Usage()
+            cached = False
+            messages = build_agent_repair_messages(
+                stage="review",
+                source_segments=source_segments,
+                translated_segments=translated_segments,
+                target_language=self.options.target_language,
+                last_error=str(repair_error),
+                attempt_logs=attempt_logs,
+                agent_attempt_logs=agent_attempt_logs,
+            )
+            try:
+                request_hash = build_request_hash(
+                    provider=self.options.provider,
+                    model=self.options.model,
+                    stage="agent_review_repair",
+                    messages=messages,
+                )
+                if self.options.use_cache:
+                    cached_entry = self.cache_store.load("agent_review_repair", request_hash)
+                    if cached_entry is not None:
+                        payload, _ = cached_entry
+                        cached = True
+                        self.cache_hits += 1
+                if payload is None:
+                    payload, usage = self._require_backend().generate_json(messages)
+                    total_usage.add(usage)
+                lines = parse_translation_lines(payload.get("lines", []))  # type: ignore[union-attr]
+                validate_translation_batch(source_segments, lines)
+                result = ReviewResult(
+                    lines=lines,
+                    review_notes=str(payload.get("review_notes", "")).strip(),  # type: ignore[union-attr]
+                )
+                if self.options.use_cache and not cached:
+                    self.cache_store.save("agent_review_repair", request_hash, payload, usage)  # type: ignore[arg-type]
+                agent_attempt_logs.append(
+                    {
+                        "attempt": attempt,
+                        "cached": cached,
+                        "error": None,
+                        "error_meta": None,
+                        "payload": payload,
+                        "messages": messages,
+                    }
+                )
+                log_path = self.agent_log_store.write(
+                    stage="review",
+                    batch_index=batch_index,
+                    success=True,
+                    attempts=agent_attempt_logs,
+                )
+                self.agent_repairs.append(
+                    AgentRepairRecord(
+                        stage="review",
+                        batch_index=batch_index,
+                        attempts=attempt,
+                        success=True,
+                        log_path=log_path,
+                    )
+                )
+                self._record_agent_repair(
+                    stage="review",
+                    batch_index=batch_index,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    status="repaired",
+                    error="",
+                    log_path=log_path,
+                )
+                return AgentRepairOutcome(
+                    success=True,
+                    usage=total_usage,
+                    attempts=agent_attempt_logs,
+                    log_path=log_path,
+                    review_result=result,
+                )
+            except Exception as exc:
+                repair_error = exc
+                agent_attempt_logs.append(
+                    {
+                        "attempt": attempt,
+                        "cached": cached,
+                        "error": str(exc),
+                        "error_meta": self._error_metadata(exc),
+                        "payload": payload,
+                        "messages": messages,
+                    }
+                )
+                log_path = self.agent_log_store.write(
+                    stage="review",
+                    batch_index=batch_index,
+                    success=False,
+                    attempts=agent_attempt_logs,
+                    final_error=str(exc),
+                )
+                self._record_agent_repair(
+                    stage="review",
+                    batch_index=batch_index,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    status="failed" if attempt == max_attempts else "retrying",
+                    error=str(exc),
+                    log_path=log_path,
+                )
+
+        self.agent_repairs.append(
+            AgentRepairRecord(
+                stage="review",
+                batch_index=batch_index,
+                attempts=max_attempts,
+                success=False,
+                log_path=log_path,
+                error=str(repair_error),
+            )
+        )
+        return AgentRepairOutcome(
+            success=False,
+            usage=total_usage,
+            attempts=agent_attempt_logs,
+            log_path=log_path,
+            error=str(repair_error),
+        )
+
+    def _should_run_agent_repair(self, exc: Exception, payload: object) -> bool:
+        if not self.options.agent or self.options.agent_repair_attempts <= 0:
+            return False
+        if isinstance(exc, BackendRequestError):
+            return False
+        if isinstance(exc, ValidationError):
+            return True
+        if isinstance(exc, KeyError):
+            return True
+        if isinstance(exc, ValueError) and "Failed to parse JSON object" in str(exc):
+            return True
+        if payload is not None and isinstance(exc, (AttributeError, TypeError, ValueError)):
+            return True
+        return False
+
+    def _record_agent_repair(
+        self,
+        *,
+        stage: str,
+        batch_index: int,
+        attempt: int,
+        max_attempts: int,
+        status: str,
+        error: str,
+        log_path: Path,
+    ) -> None:
+        recorder = getattr(self.dashboard, "record_agent_repair", None)
+        if not callable(recorder):
+            return
+        recorder(
+            stage=stage,
+            batch_index=batch_index,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            status=status,
+            error=error,
+            log_path=str(log_path),
+        )
+
+    def _format_agent_failure_detail(self, outcome: AgentRepairOutcome) -> str:
+        return (
+            f"Agent repair failed after {len(outcome.attempts)} attempts. "
+            f"Agent log saved to: {outcome.log_path}"
+        )
 
     def _build_output_segments(
         self,

@@ -28,6 +28,7 @@ class RuntimePaths:
     translated_batches_dir: Path
     reviewed_batches_dir: Path
     translation_memory_path: Path
+    agent_logs_dir: Path
 
 
 @dataclass(slots=True)
@@ -65,6 +66,7 @@ def build_runtime_paths(
         translated_batches_dir=run_dir / "translated_batches",
         reviewed_batches_dir=run_dir / "reviewed_batches",
         translation_memory_path=root_dir / f"translation_memory.v2.{language_pair}.{translation_memory_mode}.json",
+        agent_logs_dir=run_dir / "agent_logs",
     )
 
 
@@ -281,6 +283,7 @@ class FailureStore:
         batch_segments: list[SubtitleSegment],
         messages: list[dict[str, str]],
         attempts: list[dict[str, Any]],
+        agent_attempts: list[dict[str, Any]] | None = None,
         translated_segments: list[SubtitleSegment] | None = None,
     ) -> Path:
         path = self.failures_dir / f"{stage}_batch_{batch_index:04d}.json"
@@ -295,6 +298,35 @@ class FailureStore:
                 for item in (translated_segments or [])
             ],
             "attempts": attempts,
+            "agent_attempts": agent_attempts or [],
+        }
+        _write_json(path, payload)
+        return path
+
+
+class AgentLogStore:
+    def __init__(self, agent_logs_dir: Path) -> None:
+        self.agent_logs_dir = agent_logs_dir
+
+    def path_for(self, stage: str, batch_index: int) -> Path:
+        return self.agent_logs_dir / f"{stage}_batch_{batch_index:04d}.json"
+
+    def write(
+        self,
+        *,
+        stage: str,
+        batch_index: int,
+        success: bool,
+        attempts: list[dict[str, Any]],
+        final_error: str | None = None,
+    ) -> Path:
+        path = self.path_for(stage, batch_index)
+        payload = {
+            "stage": stage,
+            "batch_index": batch_index,
+            "success": success,
+            "attempts": attempts,
+            "final_error": final_error,
         }
         _write_json(path, payload)
         return path

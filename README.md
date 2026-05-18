@@ -17,6 +17,7 @@
 - 支持常用目标语言缩写，如 `zh`、`en`、`ja`
 - 智能批量翻译、上下文记忆和 `--fast` 快速模式
 - glossary、cache、translation memory、断点续跑
+- 默认开启运行时 agent 自修复：模型输出结构错误时读取失败日志、自动修正并继续跑，可用 `--no-agent` 关闭
 - 高风险 batch 定向复审与失败样本落盘
 - `subbake.toml` 配置文件和多 profile 模型配置
 - 基于 `rich` 的命令行可视化，包括进度、时间线和 Token 用量

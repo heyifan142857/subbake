@@ -95,6 +95,37 @@ class MockBackend(LLMBackend):
                 ],
                 "review_notes": "Mock review kept translations unchanged.",
             }
+        elif task == "agent_repair_translation":
+            context = json.loads(_extract_between(prompt, "AGENT_REPAIR_JSON_START", "AGENT_REPAIR_JSON_END"))
+            target_language = normalize_language_name(str(context.get("target_language", "Chinese")))
+            tag = language_short_code(target_language)
+            result = {
+                "lines": [
+                    {
+                        "id": item["id"],
+                        "translation": "" if not item["text"].strip() else f"[MOCK-{tag}] {item['text']}",
+                    }
+                    for item in context["source_lines"]
+                ],
+                "summary": "Mock agent repaired the subtitle batch.",
+                "glossary_updates": [],
+            }
+        elif task == "agent_repair_review":
+            context = json.loads(_extract_between(prompt, "AGENT_REPAIR_JSON_START", "AGENT_REPAIR_JSON_END"))
+            current_by_id = {
+                item["id"]: item.get("translation", "")
+                for item in context.get("current_translations", [])
+            }
+            result = {
+                "lines": [
+                    {
+                        "id": item["id"],
+                        "translation": current_by_id.get(item["id"]) or item["text"],
+                    }
+                    for item in context["source_lines"]
+                ],
+                "review_notes": "Mock agent repaired the review batch.",
+            }
         else:
             raise ValueError(f"Unsupported mock task: {task}")
 

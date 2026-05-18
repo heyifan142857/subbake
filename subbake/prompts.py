@@ -168,8 +168,111 @@ def build_review_messages(
     ]
 
 
+def build_agent_repair_messages(
+    *,
+    stage: str,
+    source_segments: list[SubtitleSegment],
+    target_language: str,
+    last_error: str,
+    attempt_logs: list[dict],
+    agent_attempt_logs: list[dict] | None = None,
+    translated_segments: list[SubtitleSegment] | None = None,
+) -> list[dict[str, str]]:
+    stage = stage.strip().lower()
+    if stage not in {"translate", "review"}:
+        raise ValueError(f"Unsupported agent repair stage: {stage}")
+
+    expected_ids = [segment.id for segment in source_segments]
+    repair_payload = {
+        "stage": stage,
+        "target_language": target_language,
+        "last_error": last_error,
+        "expected_count": len(source_segments),
+        "expected_ids": expected_ids,
+        "source_lines": [
+            {
+                "id": segment.id,
+                "text": segment.text,
+            }
+            for segment in source_segments
+        ],
+        "failed_attempts": _compact_attempt_logs(attempt_logs),
+        "agent_attempts": _compact_attempt_logs(agent_attempt_logs or []),
+    }
+    if translated_segments is not None:
+        repair_payload["current_translations"] = [
+            {
+                "id": segment.id,
+                "translation": segment.text,
+            }
+            for segment in translated_segments
+        ]
+
+    task = "agent_repair_translation" if stage == "translate" else "agent_repair_review"
+    return_keys = (
+        '"lines", "summary", and "glossary_updates"'
+        if stage == "translate"
+        else '"lines" and "review_notes"'
+    )
+    system_prompt = (
+        "You are SubBake's runtime repair agent.\n"
+        "Return valid JSON only.\n"
+        "Repair the failed model output without changing source text, subtitle ids, order, count, runtime config, or files.\n"
+        f"Every non-empty source entry must produce one non-empty {target_language} translation with the same id."
+    )
+    user_prompt = (
+        "TASK_START\n"
+        f"{task}\n"
+        "TASK_END\n"
+        "Read this failure log and return a corrected response for the same batch.\n"
+        "Use expected_ids as the complete authoritative list and preserve that exact order.\n"
+        "Do not explain the fix. Do not include markdown.\n"
+        f"Return JSON only with keys {return_keys}.\n"
+        "AGENT_REPAIR_JSON_START\n"
+        f"{_compact_json(repair_payload)}\n"
+        "AGENT_REPAIR_JSON_END\n"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
 def _compact_json(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _compact_attempt_logs(attempt_logs: list[dict], limit: int = 4) -> list[dict]:
+    compacted: list[dict] = []
+    for attempt_log in attempt_logs[-limit:]:
+        payload = attempt_log.get("payload")
+        compacted.append(
+            {
+                "attempt": attempt_log.get("attempt"),
+                "cached": attempt_log.get("cached"),
+                "error": _truncate_text(str(attempt_log.get("error", "")).strip(), 1200),
+                "payload": payload if isinstance(payload, dict) else payload,
+                "split_retry": _compact_split_retry(attempt_log.get("split_retry")),
+            }
+        )
+    return compacted
+
+
+def _compact_split_retry(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "triggered": value.get("triggered"),
+        "sizes": value.get("sizes"),
+        "resolved": value.get("resolved"),
+        "error": _truncate_text(str(value.get("error", "")).strip(), 1200),
+    }
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
 
 
 def _translation_structure_notes(batch_segments: list[SubtitleSegment]) -> list[str]:

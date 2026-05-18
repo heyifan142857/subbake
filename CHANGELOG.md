@@ -4,6 +4,13 @@ This file tracks notable changes for each release.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-18
+
+### Added
+
+- Runtime agent repair is now enabled by default for malformed model output, with `--no-agent` and `agent = false` to disable it.
+- Agent repair attempts now have a Rich dashboard log panel, persisted `agent_logs`, failure-sample attempt details, and final CLI summaries when triggered.
+
 ## [0.3.1] - 2026-05-18
 
 ### Fixed

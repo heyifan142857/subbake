@@ -77,6 +77,16 @@ class BatchPlanEntry:
 
 
 @dataclass(slots=True)
+class AgentRepairRecord:
+    stage: str
+    batch_index: int
+    attempts: int
+    success: bool
+    log_path: Path
+    error: str = ""
+
+
+@dataclass(slots=True)
 class PipelineOptions:
     input_path: Path
     output_path: Path | None = None
@@ -96,6 +106,8 @@ class PipelineOptions:
     dry_run: bool = False
     resume: bool = True
     use_cache: bool = True
+    agent: bool = True
+    agent_repair_attempts: int = 2
     work_dir: Path | None = None
     glossary_path: Path | None = None
 
@@ -114,3 +126,4 @@ class PipelineResult:
     translation_memory_hits: int = 0
     state_path: Path | None = None
     glossary_path: Path | None = None
+    agent_repairs: list[AgentRepairRecord] = field(default_factory=list)
