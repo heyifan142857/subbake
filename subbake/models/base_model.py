@@ -126,6 +126,15 @@ class MockBackend(LLMBackend):
                 ],
                 "review_notes": "Mock agent repaired the review batch.",
             }
+        elif task == "agent_edit_subtitle":
+            payload = json.loads(_extract_between(prompt, "EDIT_JSON_START", "EDIT_JSON_END"))
+            result = {
+                "lines": [
+                    {"id": item["id"], "translation": item["translation"]}
+                    for item in payload["lines"]
+                ],
+                "edit_notes": "Mock edit kept subtitles unchanged.",
+            }
         else:
             raise ValueError(f"Unsupported mock task: {task}")
 

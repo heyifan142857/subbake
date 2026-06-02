@@ -9,6 +9,8 @@
 
 它默认把字幕翻译为中文，也支持 `en`、`ja`、`ko`、`fr`、`es`、`de` 等常用目标语言，并提供智能批次切分、上下文记忆、缓存、断点续跑、高风险批次复审和默认开启的运行时 agent 自修复。
 
+裸 `sbake` 会进入交互式 agent，可用 `@文件` 或 `@文件夹` 触发翻译、`/model` 或 `/profile` 切换配置 profile、`/clear` 开新会话、`sbake resume` 恢复最近会话。`sbake translate` 仍保留原有命令模式。
+
 ## 安装
 
 ```bash
@@ -48,6 +50,18 @@ sbake translate input.srt --provider anthropic --model your-model
 sbake translate input.srt --provider mock
 ```
 
+整季字幕批译：
+
+```bash
+sbake series ./Season01 --profile chatgpt
+```
+
+交互式 agent：
+
+```bash
+sbake
+```
+
 ## 文档
 
 - [项目首页](https://github.com/heyifan142857/SubBake)
@@ -58,6 +72,7 @@ sbake translate input.srt --provider mock
 
 ```bash
 sbake translate --help
+sbake series --help
 sbake check-key --help
 sbake clean --help
 ```

@@ -238,6 +238,59 @@ def build_agent_repair_messages(
     ]
 
 
+def build_subtitle_edit_messages(
+    *,
+    target_segments: list[SubtitleSegment],
+    instruction: str,
+    target_language: str,
+    source_segments: list[SubtitleSegment] | None = None,
+) -> list[dict[str, str]]:
+    edit_payload = {
+        "target_language": target_language,
+        "instruction": instruction,
+        "expected_count": len(target_segments),
+        "expected_ids": [segment.id for segment in target_segments],
+        "lines": [
+            {
+                "id": segment.id,
+                "translation": segment.text,
+            }
+            for segment in target_segments
+        ],
+    }
+    if source_segments is not None:
+        edit_payload["source_lines"] = [
+            {
+                "id": segment.id,
+                "text": segment.text,
+            }
+            for segment in source_segments
+        ]
+
+    system_prompt = (
+        "You are SubBake's subtitle editing agent.\n"
+        "Return valid JSON only.\n"
+        f"Edit {target_language} subtitles according to the user's instruction.\n"
+        "Do not change subtitle ids, order, count, timings, or file format."
+    )
+    user_prompt = (
+        "TASK_START\n"
+        "agent_edit_subtitle\n"
+        "TASK_END\n"
+        "Apply the requested edit only where needed.\n"
+        "Use expected_ids as the complete authoritative list and preserve that exact order.\n"
+        "Keep good lines unchanged. Keep blank lines blank.\n"
+        'Return JSON only with keys "lines" and "edit_notes".\n'
+        "EDIT_JSON_START\n"
+        f"{_compact_json(edit_payload)}\n"
+        "EDIT_JSON_END\n"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
 def _compact_json(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 

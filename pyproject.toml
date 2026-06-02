@@ -14,6 +14,7 @@ authors = [
   { name = "azote", email = "231880175@smail.nju.edu.cn" },
 ]
 keywords = [
+  "agent",
   "subtitle",
   "translation",
   "cli",
@@ -38,6 +39,7 @@ classifiers = [
   "Topic :: Utilities",
 ]
 dependencies = [
+  "prompt_toolkit>=3.0.43",
   "rich>=13.7.0",
   "typer>=0.12.0",
 ]

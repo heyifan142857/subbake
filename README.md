@@ -18,6 +18,8 @@
 - 智能批量翻译、上下文记忆和 `--fast` 快速模式
 - glossary、cache、translation memory、断点续跑
 - 默认开启运行时 agent 自修复：模型输出结构错误时读取失败日志、自动修正并继续跑，可用 `--no-agent` 关闭
+- 裸 `sbake` 进入交互式 agent，可用 `@文件`、`@文件夹` 触发翻译，`/model` 或 `/profile` 切换 profile，`/clear` 开新会话，`sbake resume` 回到最近会话
+- `sbake series` 支持按文件夹翻译整季字幕，共享 glossary 和 translation memory
 - 高风险 batch 定向复审与失败样本落盘
 - `subbake.toml` 配置文件和多 profile 模型配置
 - 基于 `rich` 的命令行可视化，包括进度、时间线和 Token 用量
@@ -64,6 +66,29 @@ sbake translate input.srt --provider mock
 sbake translate input.srt --provider openai --model your-model --target-language en
 ```
 
+进入 agent 交互模式：
+
+```bash
+sbake
+sbake resume
+```
+
+在 agent 中可以输入：
+
+```text
+@episode01.srt
+@Season01
+/model fast_en
+分析 @.subbake/runs/.../failures/translate_batch_0001.json
+/edit @episode01.translated.srt 统一角色名译法
+```
+
+整季字幕批译：
+
+```bash
+sbake series ./Season01 --profile chatgpt
+```
+
 配置文件示例见 [examples/subbake.toml](examples/subbake.toml)。
 
 ## 文档
@@ -74,6 +99,7 @@ sbake translate input.srt --provider openai --model your-model --target-language
 
 ```bash
 sbake translate --help
+sbake series --help
 sbake check-key --help
 sbake clean --help
 ```

@@ -77,8 +77,47 @@ class CLITestCase(unittest.TestCase):
         self.assertIn("--target-language", output)
         self.assertIn("--config", output)
         self.assertIn("--profile", output)
+        self.assertIn("sbake series", output)
+        self.assertIn("sbake resume", output)
         self.assertIn("sbake check-key", output)
         self.assertIn("sbake clean input.srt", output)
+
+    def test_bare_sbake_starts_agent_and_can_exit(self) -> None:
+        with self.runner.isolated_filesystem():
+            result = self.runner.invoke(app, [], input="/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("SubBake agent", output)
+            self.assertIn("sbake[", output)
+
+    def test_agent_model_command_switches_config_profile(self) -> None:
+        with self.runner.isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[profiles.alpha]\n"
+                'provider = "mock"\n'
+                'model = "mock-alpha"\n\n'
+                "[profiles.beta]\n"
+                'provider = "mock"\n'
+                'model = "mock-beta"\n',
+                encoding="utf-8",
+            )
+
+            result = self.runner.invoke(app, [], input="/model beta\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Profile switched: beta", output)
+            self.assertIn("mock / mock-beta", output)
+
+    def test_resume_command_starts_agent_when_no_session_exists(self) -> None:
+        with self.runner.isolated_filesystem():
+            result = self.runner.invoke(app, ["resume"], input="/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("No previous agent session found", output)
+            self.assertIn("SubBake agent", output)
 
     def test_version_flag_prints_package_version(self) -> None:
         result = self.runner.invoke(app, ["-V"])
@@ -287,6 +326,77 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("1 triggered, 1 repaired", output)
             self.assertIn("translate batch 1", output)
             self.assertIn("Logs:", output)
+
+    def test_series_command_translates_folder_with_shared_runtime_root(self) -> None:
+        with self.runner.isolated_filesystem():
+            season = Path("season")
+            season.mkdir()
+            (season / "episode2.txt").write_text("hello Alice\n", encoding="utf-8")
+            (season / "episode10.txt").write_text("hello Alice\n", encoding="utf-8")
+            (season / "episode2.translated.txt").write_text("existing\n", encoding="utf-8")
+
+            result = self.runner.invoke(
+                app,
+                [
+                    "series",
+                    str(season),
+                    "--provider",
+                    "mock",
+                    "--model",
+                    "mock-zh",
+                    "--no-final-review",
+                ],
+            )
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual((season / "episode2.translated.txt").read_text(encoding="utf-8"), "existing\n")
+            self.assertIn("[MOCK-ZH] hello Alice", (season / "episode10.translated.txt").read_text(encoding="utf-8"))
+            self.assertTrue((season / ".subbake").exists())
+            self.assertIn("1 processed, 1 skipped, 0 failed", output)
+
+    def test_agent_folder_reference_translates_series(self) -> None:
+        with self.runner.isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            season = Path("season")
+            season.mkdir()
+            (season / "episode1.txt").write_text("hello\n", encoding="utf-8")
+
+            result = self.runner.invoke(app, [], input="@season\n/exit\n")
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("[MOCK-ZH] hello", (season / "episode1.translated.txt").read_text(encoding="utf-8"))
+
+    def test_agent_edit_generated_subtitle_creates_backup(self) -> None:
+        with self.runner.isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("clip.txt").write_text("hello\n", encoding="utf-8")
+            Path("clip.translated.txt").write_text("[MOCK-ZH] hello\n", encoding="utf-8")
+
+            result = self.runner.invoke(
+                app,
+                [],
+                input="/edit @clip.translated.txt keep the translation unchanged\n/exit\n",
+            )
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Edited:", output)
+            self.assertEqual(Path("clip.translated.txt").read_text(encoding="utf-8"), "[MOCK-ZH] hello\n")
+            backups = list(Path(".subbake/agent/backups").glob("*/clip.translated.txt"))
+            self.assertEqual(len(backups), 1)
 
     def _strip_ansi(self, value: str) -> str:
         return re.sub(r"\x1b\[[0-9;]*m", "", value)
