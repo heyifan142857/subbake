@@ -5,99 +5,88 @@
 [![CI](https://github.com/heyifan142857/SubBake/actions/workflows/ci.yml/badge.svg)](https://github.com/heyifan142857/SubBake/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-`subbake` 是一个简单的字幕翻译 CLI，默认将字幕翻译为中文，也可以通过 `--target-language en` 这类参数切到其他常用语言。
+`subbake` is an agent-first subtitle translation CLI.
 
-它的目标是用尽量直接的命令行工作流处理字幕翻译，同时保留对批量翻译、断点续跑、缓存和复审这些实用能力的支持。
+It translates `.srt`, `.vtt`, and line-based `.txt` subtitles with LLMs, while preserving subtitle structure and keeping long-running translation work recoverable through cache, translation memory, glossary, and resume state.
+
+The main entrypoint is the interactive agent:
+
+```bash
+sbake
+```
+
+Inside the agent, you can point at files or folders, switch model profiles, resume sessions, inspect SubBake failure logs, and ask it to make constrained edits to generated translated subtitles.
+
+```text
+@episode01.srt
+@Season01
+/model fast_zh
+分析 @.subbake/runs/.../failures/translate_batch_0001.json
+/edit @episode01.translated.srt 统一角色名译法
+```
+
+For detailed setup, provider configuration, examples, and workflow guidance, use the [project Wiki](https://github.com/heyifan142857/SubBake/wiki).
 
 ![subbake CLI demo](assets/subbake-demo.gif)
 
-## 核心能力
+## Why SubBake
 
-- 支持 `.srt`、`.vtt` 和按行处理的 `.txt`
-- 支持常用目标语言缩写，如 `zh`、`en`、`ja`
-- 智能批量翻译、上下文记忆和 `--fast` 快速模式
-- glossary、cache、translation memory、断点续跑
-- 默认开启运行时 agent 自修复：模型输出结构错误时读取失败日志、自动修正并继续跑，可用 `--no-agent` 关闭
-- 裸 `sbake` 进入交互式 agent，可用 `@文件`、`@文件夹` 触发翻译，`/model` 或 `/profile` 切换 profile，`/clear` 开新会话，`sbake resume` 回到最近会话
-- `sbake series` 支持按文件夹翻译整季字幕，共享 glossary 和 translation memory
-- 高风险 batch 定向复审与失败样本落盘
-- `subbake.toml` 配置文件和多 profile 模型配置
-- 基于 `rich` 的命令行可视化，包括进度、时间线和 Token 用量
+- Agent workflow: run `sbake`, reference `@file` or `@folder`, switch profiles with `/model`, and resume with `sbake resume`.
+- Subtitle-safe translation: preserves ids, order, timing, cue settings, and line counts.
+- Series support: translate a whole season folder with shared glossary and translation memory.
+- Runtime repair: malformed model output can be logged, diagnosed, and automatically repaired during translation.
+- Review pass: high-risk batches can receive targeted consistency review.
+- Practical persistence: cache, run state, failure samples, glossary, and translation memory live under `.subbake`.
+- Config profiles: `subbake.toml` supports multiple provider/model setups for quick switching.
 
-## 快速开始
-
-安装并运行：
+## Install
 
 ```bash
 pip install subbake
-sbake translate input.srt --provider openai --model your-model
 ```
 
-使用 OpenAI 兼容接口时：
+Then configure a provider profile. See [examples/subbake.toml](examples/subbake.toml) and the [Wiki](https://github.com/heyifan142857/SubBake/wiki).
 
-```bash
-export OPENAI_API_KEY="your_api_key"
-export OPENAI_BASE_URL="https://your-provider.example.com/v1"
-```
+## CLI Modes
 
-Gemini 使用：
-
-```bash
-export GEMINI_API_KEY="your_api_key"
-sbake translate input.srt --provider gemini --model gemini-2.5-flash
-```
-
-Anthropic 使用：
-
-```bash
-export ANTHROPIC_API_KEY="your_api_key"
-sbake translate input.srt --provider anthropic --model your-model
-```
-
-内置 `mock` 后端可用于本地联调：
-
-```bash
-sbake translate input.srt --provider mock
-```
-
-翻译到其他目标语言：
-
-```bash
-sbake translate input.srt --provider openai --model your-model --target-language en
-```
-
-进入 agent 交互模式：
+Interactive agent:
 
 ```bash
 sbake
 sbake resume
 ```
 
-在 agent 中可以输入：
+Classic single-file command:
 
-```text
-@episode01.srt
-@Season01
-/model fast_en
-分析 @.subbake/runs/.../failures/translate_batch_0001.json
-/edit @episode01.translated.srt 统一角色名译法
+```bash
+sbake translate input.srt --profile chatgpt
 ```
 
-整季字幕批译：
+Series command:
 
 ```bash
 sbake series ./Season01 --profile chatgpt
 ```
 
-配置文件示例见 [examples/subbake.toml](examples/subbake.toml)。
-
-## 文档
-
-文档与使用说明见 [项目 Wiki](https://github.com/heyifan142857/SubBake/wiki)。
-
-完整命令说明仍可直接查看：
+Credential and cleanup utilities:
 
 ```bash
+sbake check-key --profile chatgpt
+sbake clean .
+```
+
+## Documentation
+
+The Wiki is the primary user guide:
+
+- [Project Wiki](https://github.com/heyifan142857/SubBake/wiki)
+- [Configuration example](examples/subbake.toml)
+- [PyPI package](https://pypi.org/project/subbake/)
+
+Command help is also available from the CLI:
+
+```bash
+sbake --help
 sbake translate --help
 sbake series --help
 sbake check-key --help

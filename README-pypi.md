@@ -5,72 +5,86 @@
 [![CI](https://github.com/heyifan142857/SubBake/actions/workflows/ci.yml/badge.svg)](https://github.com/heyifan142857/SubBake/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/heyifan142857/SubBake/blob/main/LICENSE)
 
-`subbake` 是一个字幕翻译 CLI，支持 `.srt`、`.vtt` 和按行处理的 `.txt`。
+`subbake` is an agent-first subtitle translation CLI.
 
-它默认把字幕翻译为中文，也支持 `en`、`ja`、`ko`、`fr`、`es`、`de` 等常用目标语言，并提供智能批次切分、上下文记忆、缓存、断点续跑、高风险批次复审和默认开启的运行时 agent 自修复。
+It translates `.srt`, `.vtt`, and line-based `.txt` subtitles with LLMs, while preserving subtitle structure and keeping long-running translation work recoverable through cache, translation memory, glossary, and resume state.
 
-裸 `sbake` 会进入交互式 agent，可用 `@文件` 或 `@文件夹` 触发翻译、`/model` 或 `/profile` 切换配置 profile、`/clear` 开新会话、`sbake resume` 恢复最近会话。`sbake translate` 仍保留原有命令模式。
-
-## 安装
-
-```bash
-pip install subbake
-```
-
-## 快速开始
-
-```bash
-sbake translate input.srt --provider openai --model your-model
-```
-
-OpenAI 兼容接口：
-
-```bash
-export OPENAI_API_KEY="your_api_key"
-export OPENAI_BASE_URL="https://your-provider.example.com/v1"
-```
-
-Gemini：
-
-```bash
-export GEMINI_API_KEY="your_api_key"
-sbake translate input.srt --provider gemini --model gemini-2.5-flash
-```
-
-Anthropic：
-
-```bash
-export ANTHROPIC_API_KEY="your_api_key"
-sbake translate input.srt --provider anthropic --model your-model
-```
-
-本地联调：
-
-```bash
-sbake translate input.srt --provider mock
-```
-
-整季字幕批译：
-
-```bash
-sbake series ./Season01 --profile chatgpt
-```
-
-交互式 agent：
+The main entrypoint is the interactive agent:
 
 ```bash
 sbake
 ```
 
-## 文档
+Inside the agent, you can point at files or folders, switch model profiles, resume sessions, inspect SubBake failure logs, and ask it to make constrained edits to generated translated subtitles.
 
-- [项目首页](https://github.com/heyifan142857/SubBake)
-- [文档与使用说明](https://github.com/heyifan142857/SubBake/wiki)
-- [配置文件示例](https://github.com/heyifan142857/SubBake/blob/main/examples/subbake.toml)
+```text
+@episode01.srt
+@Season01
+/model fast_zh
+分析 @.subbake/runs/.../failures/translate_batch_0001.json
+/edit @episode01.translated.srt 统一角色名译法
+```
 
-## 常用命令
+For detailed setup, provider configuration, examples, and workflow guidance, use the [project Wiki](https://github.com/heyifan142857/SubBake/wiki).
+
+## Why SubBake
+
+- Agent workflow: run `sbake`, reference `@file` or `@folder`, switch profiles with `/model`, and resume with `sbake resume`.
+- Subtitle-safe translation: preserves ids, order, timing, cue settings, and line counts.
+- Series support: translate a whole season folder with shared glossary and translation memory.
+- Runtime repair: malformed model output can be logged, diagnosed, and automatically repaired during translation.
+- Review pass: high-risk batches can receive targeted consistency review.
+- Practical persistence: cache, run state, failure samples, glossary, and translation memory live under `.subbake`.
+- Config profiles: `subbake.toml` supports multiple provider/model setups for quick switching.
+
+## Install
 
 ```bash
+pip install subbake
+```
+
+Then configure a provider profile. See the [configuration example](https://github.com/heyifan142857/SubBake/blob/main/examples/subbake.toml) and the [Wiki](https://github.com/heyifan142857/SubBake/wiki).
+
+## CLI Modes
+
+Interactive agent:
+
+```bash
+sbake
+sbake resume
+```
+
+Classic single-file command:
+
+```bash
+sbake translate input.srt --profile chatgpt
+```
+
+Series command:
+
+```bash
+sbake series ./Season01 --profile chatgpt
+```
+
+Credential and cleanup utilities:
+
+```bash
+sbake check-key --profile chatgpt
+sbake clean .
+```
+
+## Documentation
+
+The Wiki is the primary user guide:
+
+- [Project Wiki](https://github.com/heyifan142857/SubBake/wiki)
+- [Configuration example](https://github.com/heyifan142857/SubBake/blob/main/examples/subbake.toml)
+- [GitHub repository](https://github.com/heyifan142857/SubBake)
+
+Command help is also available from the CLI:
+
+```bash
+sbake --help
 sbake translate --help
 sbake series --help
 sbake check-key --help
