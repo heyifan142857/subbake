@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 
+from subbake.title_matching import title_query_variants
+
 
 PROTECTED_PATH_PARTS = {".git", ".hg", ".svn", ".venv", "venv", ".subbake", "__pycache__"}
 
@@ -63,17 +65,24 @@ class FileOperationGuard:
             if item.is_file()
         ]
         matches: list[str] = []
-        expression = re.compile(re.escape(pattern), re.IGNORECASE)
+        expressions = [
+            re.compile(re.escape(variant), re.IGNORECASE)
+            for variant in title_query_variants(pattern)
+        ]
         for file_path in files:
             if len(matches) >= limit:
                 break
+            relative = file_path.relative_to(self.project_root)
+            if _matches_any(expressions, str(relative)):
+                matches.append(str(relative))
+                if len(matches) >= limit:
+                    break
             try:
                 text = file_path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
                 continue
             for line_number, line in enumerate(text.splitlines(), start=1):
-                if expression.search(line):
-                    relative = file_path.relative_to(self.project_root)
+                if _matches_any(expressions, line):
                     matches.append(f"{relative}:{line_number}: {line}")
                     if len(matches) >= limit:
                         break
@@ -177,3 +186,7 @@ class FileOperationGuard:
             backup_path = backup_path.with_name(f"{backup_path.stem}-{path.stat().st_mtime_ns}{backup_path.suffix}")
         shutil.copy2(path, backup_path)
         return backup_path
+
+
+def _matches_any(expressions: list[re.Pattern[str]], value: str) -> bool:
+    return any(expression.search(value) for expression in expressions)

@@ -47,17 +47,23 @@ class SeriesResult:
         return len(self.failures)
 
 
-def discover_series_files(root: Path, *, recursive: bool = False) -> list[Path]:
+def discover_series_files(
+    root: Path,
+    *,
+    recursive: bool = False,
+    suffixes: set[str] | None = None,
+) -> list[Path]:
     if not root.exists():
         raise FileNotFoundError(f"Series folder not found: {root}")
     if not root.is_dir():
         raise ValueError(f"Series target must be a directory: {root}")
 
+    supported_suffixes = _normalize_suffixes(suffixes)
     candidates = root.rglob("*") if recursive else root.glob("*")
     files = [
         path
         for path in candidates
-        if _is_supported_source(path, root=root)
+        if _is_supported_source(path, root=root, suffixes=supported_suffixes)
     ]
     return sorted(files, key=_natural_sort_key)
 
@@ -70,8 +76,9 @@ def translate_series(
     console: Console,
     recursive: bool = False,
     overwrite: bool = False,
+    suffixes: set[str] | None = None,
 ) -> SeriesResult:
-    files = discover_series_files(root, recursive=recursive)
+    files = discover_series_files(root, recursive=recursive, suffixes=suffixes)
     result = SeriesResult(root=root, files=files)
     shared_values = dict(values)
     if shared_values.get("work_dir") is None:
@@ -148,10 +155,10 @@ def resolve_series_output_path(
     return input_path.with_name(f"{input_path.stem}.{flavor}{suffix}")
 
 
-def _is_supported_source(path: Path, *, root: Path) -> bool:
+def _is_supported_source(path: Path, *, root: Path, suffixes: set[str]) -> bool:
     if not path.is_file():
         return False
-    if path.suffix.lower() not in SUPPORTED_SUBTITLE_SUFFIXES:
+    if path.suffix.lower() not in suffixes:
         return False
     if any(marker in path.name for marker in GENERATED_MARKERS):
         return False
@@ -160,6 +167,17 @@ def _is_supported_source(path: Path, *, root: Path) -> bool:
     except ValueError:
         return False
     return ".subbake" not in relative.parts
+
+
+def _normalize_suffixes(suffixes: set[str] | None) -> set[str]:
+    if suffixes is None:
+        return SUPPORTED_SUBTITLE_SUFFIXES
+    normalized = {f".{suffix.lower().lstrip('.')}" for suffix in suffixes}
+    unsupported = normalized - SUPPORTED_SUBTITLE_SUFFIXES
+    if unsupported:
+        names = ", ".join(sorted(unsupported))
+        raise ValueError(f"Unsupported series input suffix: {names}")
+    return normalized
 
 
 def _natural_sort_key(path: Path) -> list[object]:

@@ -20,6 +20,7 @@ from subbake.agent import (
     CONFIG_BOOTSTRAP_CREATE,
     NEW_PROFILE_VALUE,
     SubBakeAgent,
+    _AgentLoopTrace,
     _default_api_key_env,
     _matching_picker_choices,
     _picker_choices,
@@ -76,6 +77,24 @@ class CliAgentRepairBackend(LLMBackend):
         start_index = text.index(start_marker) + len(start_marker)
         end_index = text.index(end_marker, start_index)
         return text[start_index:end_index].strip()
+
+
+class LoopingAgentBackend(LLMBackend):
+    def generate_json(self, messages: list[dict[str, str]]) -> tuple[dict, Usage]:
+        return (
+            {
+                "action": "tool_call",
+                "message": "Still looking.",
+                "tool_name": "list_files",
+                "arguments": {"path": ".", "recursive": False},
+                "reason": "Keep discovering.",
+                "confidence": 0.5,
+            },
+            Usage(input_tokens=1, output_tokens=1, total_tokens=2),
+        )
+
+    def check_credentials(self) -> tuple[bool, str]:
+        return True, "ok"
 
 
 class CLITestCase(unittest.TestCase):
@@ -232,6 +251,7 @@ class CLITestCase(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0)
             self.assertIn("SubBake agent", output)
+            self.assertIn(__version__, output)
             self.assertIn("sbake[", output)
 
     def test_agent_model_command_switches_config_profile(self) -> None:
@@ -660,6 +680,339 @@ class CLITestCase(unittest.TestCase):
             self.assertEqual(result.exit_code, 0)
             self.assertIn("[MOCK-ZH] hello", (season / "episode1.translated.txt").read_text(encoding="utf-8"))
 
+    def test_agent_current_directory_srt_request_translates_only_srt_series(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("movie1.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nhello one\n\n",
+                encoding="utf-8",
+            )
+            Path("movie2.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nhello two\n\n",
+                encoding="utf-8",
+            )
+            Path("notes.txt").write_text("do not translate\n", encoding="utf-8")
+            Path("movie.mkv").write_text("video placeholder\n", encoding="utf-8")
+
+            result = self.runner.invoke(
+                app,
+                [],
+                input="帮我把目录下.srt文件都翻译了，生成中英双语字幕。注意这是同一系列的作品。\n/exit\n",
+            )
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("现在要按同一系列翻译 2 个 .srt 文件", output)
+            self.assertIn("生成中英双语字幕", output)
+            self.assertLess(output.index("现在要按同一系列翻译"), output.index("Series:"))
+            self.assertIn("已完成 2 个文件翻译", output)
+            self.assertIn("2 processed, 0 skipped, 0 failed", output)
+            self.assertIn("hello one\n[MOCK-ZH] hello one", Path("movie1.bilingual.srt").read_text(encoding="utf-8"))
+            self.assertIn("hello two\n[MOCK-ZH] hello two", Path("movie2.bilingual.srt").read_text(encoding="utf-8"))
+            self.assertFalse(Path("notes.translated.txt").exists())
+
+    def test_agent_current_directory_series_request_passes_explicit_translation_options(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                'target_language = "zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("movie.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nhello\n\n",
+                encoding="utf-8",
+            )
+            Path("notes.txt").write_text("do not translate\n", encoding="utf-8")
+
+            result = self.runner.invoke(
+                app,
+                [],
+                input="帮我把目录下.srt文件都翻译成英文，生成txt格式字幕。\n/exit\n",
+            )
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("目标语言 English", output)
+            self.assertIn("输出 TXT", output)
+            self.assertIn("[MOCK-EN] hello", Path("movie.translated.txt").read_text(encoding="utf-8"))
+            self.assertFalse(Path("movie.translated.srt").exists())
+            self.assertFalse(Path("notes.translated.txt").exists())
+
+    def test_agent_can_retarget_latest_chinese_translation_to_chinese_english_bilingual(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                'target_language = "zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("episode.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\n你好\n\n",
+                encoding="utf-8",
+            )
+
+            result = self.runner.invoke(
+                app,
+                [],
+                input=(
+                    "翻译 @episode.srt\n"
+                    "我误翻译了中文字幕，现在我想变成中英字幕\n"
+                    "/exit\n"
+                ),
+            )
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("目标语言", output)
+            self.assertIn("English", output)
+            self.assertIn("生成中英双语字幕", output)
+            self.assertIn("[MOCK-ZH] 你好", Path("episode.translated.srt").read_text(encoding="utf-8"))
+            self.assertIn("你好\n[MOCK-EN] 你好", Path("episode.bilingual.srt").read_text(encoding="utf-8"))
+
+    def test_agent_retargets_referenced_generated_subtitle_to_source_file(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                'target_language = "zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("episode.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\n你好\n\n",
+                encoding="utf-8",
+            )
+            Path("episode.translated.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\n[MOCK-ZH] 你好\n\n",
+                encoding="utf-8",
+            )
+
+            result = self.runner.invoke(
+                app,
+                [],
+                input="把 @episode.translated.srt 变成中英字幕\n/exit\n",
+            )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("你好\n[MOCK-EN] 你好", Path("episode.bilingual.srt").read_text(encoding="utf-8"))
+
+    def test_agent_retargets_subtitle_by_title_text(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("The Matrix Revolutions 2003 REMASTERED.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHello Neo.\n\n",
+                encoding="utf-8",
+            )
+            Path("The Matrix Revolutions 2003 REMASTERED.translated.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\n[MOCK-ZH] Hello Neo.\n\n",
+                encoding="utf-8",
+            )
+
+            result = self.runner.invoke(
+                app,
+                [],
+                input="你之前翻译的The Matrix Revolutions能不能改为中英双语\n/exit\n",
+            )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn(
+                "Hello Neo.\n[MOCK-ZH] Hello Neo.",
+                Path("The Matrix Revolutions 2003 REMASTERED.bilingual.srt").read_text(encoding="utf-8"),
+            )
+
+    def test_agent_loop_interactive_trace_uses_compact_timeline(self) -> None:
+        console = Console(record=True, force_terminal=True, width=100)
+        trace = _AgentLoopTrace(console=console, interactive=True)
+
+        trace.start()
+        trace.think()
+        trace.tool("candidate_subtitles", {"query": "The Matrix"})
+        trace.observe("selected The Matrix 1999.srt")
+        trace.final(
+            {
+                "action": "tool_call",
+                "tool_name": "translate_file",
+                "arguments": {"path": "The Matrix 1999.srt", "bilingual": True},
+            }
+        )
+
+        output = console.export_text(styles=False)
+
+        self.assertEqual(output.count("Agent Loop"), 1)
+        self.assertIn("TOOL candidate_subtitles", output)
+        self.assertIn("OBSERVE selected The Matrix 1999.srt", output)
+        self.assertIn("EXECUTE translate_file", output)
+        self.assertNotIn("Starting bounded discovery.", output)
+        self.assertNotRegex(output, r"[╭╮╰╯]")
+
+    def test_agent_loop_discovers_matrix_subtitle_before_bilingual_translation(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("The Matrix 1999.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHello Neo.\n\n",
+                encoding="utf-8",
+            )
+
+            result = self.runner.invoke(app, [], input="把黑客帝国改成中英双语\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Agent Loop", output)
+            self.assertIn("TOOL candidate_subtitles", output)
+            self.assertIn("OBSERVE selected The Matrix 1999.srt", output)
+            self.assertIn("EXECUTE translate_file", output)
+            self.assertIn(
+                "Hello Neo.\n[MOCK-ZH] Hello Neo.",
+                Path("The Matrix 1999.bilingual.srt").read_text(encoding="utf-8"),
+            )
+
+    def test_agent_loop_selects_matrix_revolutions_among_matrix_files(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("The Matrix Reloaded.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHello Morpheus.\n\n",
+                encoding="utf-8",
+            )
+            Path("The Matrix Revolutions.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHello Neo.\n\n",
+                encoding="utf-8",
+            )
+
+            result = self.runner.invoke(app, [], input="The Matrix Revolutions 改成中英双语\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("TOOL candidate_subtitles", output)
+            self.assertIn("OBSERVE selected The Matrix Revolutions.srt", output)
+            self.assertTrue(Path("The Matrix Revolutions.bilingual.srt").exists())
+            self.assertFalse(Path("The Matrix Reloaded.bilingual.srt").exists())
+
+    def test_agent_loop_asks_user_when_multiple_subtitle_candidates_match(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("The Matrix Reloaded.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHello Morpheus.\n\n",
+                encoding="utf-8",
+            )
+            Path("The Matrix Revolutions.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHello Neo.\n\n",
+                encoding="utf-8",
+            )
+
+            result = self.runner.invoke(app, [], input="黑客帝国改成中英双语\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("multiple subtitle candidates", output)
+            self.assertIn("The Matrix Reloaded.srt", output)
+            self.assertIn("The Matrix Revolutions.srt", output)
+            self.assertFalse(Path("The Matrix Reloaded.bilingual.srt").exists())
+            self.assertFalse(Path("The Matrix Revolutions.bilingual.srt").exists())
+
+    def test_agent_plan_mode_runs_discovery_but_waits_to_translate(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("The Matrix.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHello Neo.\n\n",
+                encoding="utf-8",
+            )
+
+            result = self.runner.invoke(app, [], input="/plan\n把黑客帝国改成中英双语\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("TOOL candidate_subtitles", output)
+            self.assertIn("OBSERVE selected The Matrix.srt", output)
+            self.assertIn("PLAN translate_file", output)
+            self.assertIn("<proposed_plan>", output)
+            self.assertIn("Use /approve", output)
+            self.assertFalse(Path("The Matrix.bilingual.srt").exists())
+
+    def test_agent_loop_stops_after_max_steps(self) -> None:
+        with self._isolated_filesystem():
+            Path("visible.txt").write_text("hello\n", encoding="utf-8")
+
+            with patch("subbake.agent.build_backend_from_values", return_value=LoopingAgentBackend()):
+                result = self.runner.invoke(app, [], input="请先想一想怎么处理\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(output.count("TOOL list_files"), 5)
+            self.assertIn("Agent loop stopped after 5 steps without a final action.", output)
+
+    def test_agent_retargets_subtitle_by_chinese_title_alias(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("The Matrix Reloaded 2003 REMASTERED.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHello Morpheus.\n\n",
+                encoding="utf-8",
+            )
+            Path("The Matrix Revolutions 2003 REMASTERED.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHello Neo.\n\n",
+                encoding="utf-8",
+            )
+
+            result = self.runner.invoke(
+                app,
+                [],
+                input="你之前翻译的黑客帝国3能不能改为中英双语\n/exit\n",
+            )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn(
+                "Hello Neo.\n[MOCK-ZH] Hello Neo.",
+                Path("The Matrix Revolutions 2003 REMASTERED.bilingual.srt").read_text(encoding="utf-8"),
+            )
+            self.assertFalse(Path("The Matrix Reloaded 2003 REMASTERED.bilingual.srt").exists())
+
     def test_agent_edit_generated_subtitle_creates_backup(self) -> None:
         with self._isolated_filesystem():
             Path("subbake.toml").write_text(
@@ -736,6 +1089,23 @@ class CLITestCase(unittest.TestCase):
             self.assertNotIn(".git", output)
             self.assertNotIn(".venv", output)
             self.assertNotIn(".subbake", output)
+
+    def test_agent_search_files_matches_file_names(self) -> None:
+        with self._isolated_filesystem():
+            Path("The Matrix Revolutions.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHello Neo.\n\n",
+                encoding="utf-8",
+            )
+
+            result = self.runner.invoke(
+                app,
+                [],
+                input="在 @. 搜索 黑客帝国\n/exit\n",
+            )
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("The Matrix Revolutions.srt", output)
 
     def test_agent_file_operations_refuse_paths_outside_project(self) -> None:
         with self._isolated_filesystem():

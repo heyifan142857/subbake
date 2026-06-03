@@ -4,13 +4,29 @@ import json
 import re
 import sys
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.text import Text
 
+from subbake import __version__
+from subbake.agent_loop import (
+    DISCOVERY_TOOL_NAMES,
+    AgentLoopState,
+    AgentLoopStep,
+    AgentObservation,
+    FileCandidate,
+    classify_candidate_path,
+    executable_subtitle_path,
+    format_candidate_lines,
+    rank_file_candidates,
+    strong_subtitle_candidates,
+)
 from subbake.config import (
     AppConfig,
     TRANSLATE_CONFIG_KEYS,
@@ -29,10 +45,12 @@ from subbake.runtime_options import (
     build_pipeline_options,
     merge_translation_values,
 )
-from subbake.series import discover_series_files, translate_series
+from subbake.series import SUPPORTED_SUBTITLE_SUFFIXES, discover_series_files, translate_series
+from subbake.title_matching import normalize_title_text, title_tokens_from_text
 from subbake.ui import Dashboard
 
 SESSION_VERSION = 1
+AGENT_LOOP_MAX_STEPS = 5
 REFERENCE_RE = re.compile(r"@(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
 AGENT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show agent help"),
@@ -172,7 +190,7 @@ class SubBakeAgent:
         self.store.save(self.session)
 
     def run(self) -> None:
-        self.console.print("[bold green]SubBake agent[/bold green]  /help for commands, /exit to quit")
+        self.console.print(f"[bold green]SubBake agent {__version__}[/bold green]  /help for commands, /exit to quit")
         if self.config_path is not None:
             self.console.print(f"[bold green]Config:[/bold green] {self.config_path}")
         if self.profile is not None:
@@ -249,7 +267,7 @@ class SubBakeAgent:
 
     def _handle_conversational_line(self, line: str) -> None:
         self._record_event("user", line)
-        decision = self._deterministic_decision_from_line(line) or self._decide_next_action(line)
+        decision = self._deterministic_decision_from_line(line) or self._run_agent_loop(line)
         self._handle_decision(decision, original=line)
 
     def _deterministic_decision_from_line(self, line: str) -> dict[str, Any] | None:
@@ -297,6 +315,9 @@ class SubBakeAgent:
                 {"path": str(references[0]), "content": self._content_after_references(line)},
                 "Creating file.",
             )
+        series_request = self._directory_series_request(line, references)
+        if series_request is not None:
+            return decision("translate_series", series_request, "Translating subtitle series.")
         if (
             not references
             and any(word in lowered for word in ("当前目录", "目录下", "current directory", "cwd"))
@@ -311,16 +332,628 @@ class SubBakeAgent:
         cleaned = re.sub(r"^(create|append|replace)\b", "", cleaned, flags=re.IGNORECASE).strip()
         return cleaned
 
+    def _search_request(self, line: str, references: list[Path]) -> dict[str, Any] | None:
+        lowered = line.casefold()
+        if not any(word in lowered for word in ("搜索", "查找", "search", "find")):
+            return None
+        path = references[0] if references else self.cwd
+        pattern = self._search_pattern_from_text(line)
+        if not pattern:
+            return None
+        return {"path": str(path), "pattern": pattern}
+
+    def _search_pattern_from_text(self, line: str) -> str:
+        cleaned = self._remove_references(line).strip()
+        for marker in ("搜索", "查找", "search", "find"):
+            match = re.search(rf"\b{re.escape(marker)}\b|{re.escape(marker)}", cleaned, flags=re.IGNORECASE)
+            if match is not None:
+                return cleaned[match.end():].strip(" ：:=,，。")
+        return cleaned
+
+    def _directory_series_request(self, line: str, references: list[Path]) -> dict[str, Any] | None:
+        lowered = line.casefold()
+        if not any(word in lowered for word in ("翻译", "translate")):
+            return None
+
+        referenced_folder = len(references) == 1 and references[0].is_dir()
+        current_directory = not references and any(
+            word in lowered
+            for word in ("当前目录", "目录下", "current directory", "cwd")
+        )
+        if not referenced_folder and not current_directory:
+            return None
+
+        suffixes = self._series_suffixes_from_text(line)
+        broad_series_request = suffixes is not None or any(
+            word in lowered
+            for word in ("都", "全部", "所有", "系列", "season", "series", "all")
+        )
+        if not broad_series_request:
+            return None
+
+        arguments: dict[str, Any] = {
+            "path": str(references[0]) if referenced_folder else ".",
+            "recursive": any(word in lowered for word in ("递归", "子目录", "recursive", "subdir")),
+            "overwrite": any(word in lowered for word in ("覆盖", "重新翻译", "overwrite", "retranslate")),
+            "dry_run": any(word in lowered for word in ("dry run", "dry-run", "只规划", "预览")),
+        }
+        if suffixes is not None:
+            arguments["suffixes"] = sorted(suffixes)
+        arguments.update(self._translation_arguments_from_text(line))
+        return arguments
+
+    def _series_suffixes_from_text(self, line: str) -> set[str] | None:
+        lowered = self._line_without_output_format_phrases(line).casefold()
+        suffixes = {
+            suffix
+            for suffix in SUPPORTED_SUBTITLE_SUFFIXES
+            if re.search(rf"(?<![a-z0-9])\.?{re.escape(suffix.lstrip('.'))}(?![a-z0-9])", lowered)
+        }
+        return suffixes or None
+
+    def _translation_retarget_request(
+        self,
+        line: str,
+        references: list[Path],
+    ) -> tuple[str, dict[str, Any]] | None:
+        if not self._retarget_translation_requested(line):
+            return None
+
+        arguments = self._translation_arguments_from_text(line)
+        if not self._has_translation_retarget_options(arguments):
+            return None
+
+        if references:
+            target = references[0]
+            if target.is_dir():
+                return "translate_series", self._translation_arguments_for_target(
+                    path=target,
+                    arguments={"path": str(target), **arguments},
+                    series=True,
+                )
+            source_path = self._source_path_for_translation_reference(target)
+            if source_path is not None:
+                return "translate_file", self._translation_arguments_for_target(
+                    path=source_path,
+                    arguments={"path": str(source_path), **arguments},
+                    series=False,
+                )
+            return None
+
+        title_target = self._translation_source_from_title_text(line)
+        if title_target is not None:
+            return "translate_file", self._translation_arguments_for_target(
+                path=title_target,
+                arguments={"path": str(title_target), **arguments},
+                series=False,
+            )
+
+        latest = self._latest_translation_tool_call()
+        if latest is None:
+            return None
+        tool_name, latest_arguments = latest
+        merged_arguments = {**latest_arguments, **arguments}
+        return tool_name, self._translation_arguments_for_target(
+            path=Path(str(merged_arguments["path"])),
+            arguments=merged_arguments,
+            series=tool_name == "translate_series",
+        )
+
+    def _retarget_translation_requested(self, line: str) -> bool:
+        lowered = line.casefold()
+        if not any(
+            word in lowered
+            for word in (
+                "变成",
+                "变为",
+                "改成",
+                "改为",
+                "换成",
+                "做成",
+                "重新生成",
+                "再生成",
+                "rerender",
+                "re-render",
+                "make",
+            )
+        ):
+            return False
+        return any(word in lowered for word in ("字幕", "subtitle", "翻译", "translation", "双语", "bilingual"))
+
+    def _has_translation_retarget_options(self, arguments: dict[str, Any]) -> bool:
+        return any(
+            key in arguments
+            for key in ("bilingual", "target_language", "source_language", "output_format")
+        )
+
+    def _source_path_for_translation_reference(self, path: Path) -> Path | None:
+        if is_generated_subtitle(path):
+            for marker in (".translated.", ".bilingual."):
+                if marker in path.name:
+                    return path.with_name(path.name.replace(marker, ".", 1))
+        if path.suffix.lower() in SUPPORTED_SUBTITLE_SUFFIXES:
+            return path
+        return None
+
+    def _translation_source_from_title_text(self, line: str) -> Path | None:
+        tokens = self._title_tokens_from_text(line)
+        if not tokens:
+            return None
+        candidates: list[Path] = []
+        for path in self.cwd.glob("*"):
+            source_path = self._source_path_for_translation_reference(path)
+            if source_path is None:
+                continue
+            if source_path in candidates:
+                continue
+            normalized_name = normalize_title_text(source_path.stem)
+            if all(token in normalized_name for token in tokens):
+                candidates.append(source_path)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda path: (is_generated_subtitle(path), len(path.name), path.name.casefold()))
+        return candidates[0]
+
+    def _title_tokens_from_text(self, line: str) -> list[str]:
+        cleaned = self._remove_references(line)
+        alias_tokens = title_tokens_from_text(cleaned)
+        spans = re.findall(r"[A-Za-z0-9][A-Za-z0-9 ._'()-]{2,}", cleaned)
+        best = " ".join(alias_tokens)
+        for span in spans:
+            normalized = normalize_title_text(span)
+            tokens = [
+                token
+                for token in normalized.split()
+                if token not in {"the", "a", "an", "to", "of", "and", "or", "can", "could"}
+            ]
+            if len(tokens) >= 2 and len(normalized) > len(best):
+                best = normalized
+        return [
+            token
+            for token in best.split()
+            if token not in {"the", "a", "an", "to", "of", "and", "or", "can", "could"}
+        ]
+
+    def _latest_translation_tool_call(self) -> tuple[str, dict[str, Any]] | None:
+        for event in reversed(self.session.events):
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+            if event.get("kind") == "translate_file" and data.get("input_path"):
+                return "translate_file", {"path": str(data["input_path"])}
+            if event.get("kind") == "series" and data.get("path"):
+                arguments: dict[str, Any] = {"path": str(data["path"])}
+                if data.get("suffixes"):
+                    arguments["suffixes"] = data["suffixes"]
+                if data.get("recursive") is not None:
+                    arguments["recursive"] = data["recursive"]
+                return "translate_series", arguments
+        return None
+
+    def _translation_arguments_for_target(
+        self,
+        *,
+        path: Path,
+        arguments: dict[str, Any],
+        series: bool,
+    ) -> dict[str, Any]:
+        enriched = dict(arguments)
+        if "target_language" not in enriched:
+            source_language = str(enriched.get("source_language") or "").strip()
+            if not source_language:
+                source_language = self._infer_source_language_for_target(path, series=series) or ""
+            target_language = self._target_language_for_bilingual_pair_from_arguments(
+                enriched,
+                source_language=source_language,
+            )
+            if target_language is not None:
+                enriched["target_language"] = target_language
+        return enriched
+
+    def _target_language_for_bilingual_pair_from_arguments(
+        self,
+        arguments: dict[str, Any],
+        *,
+        source_language: str,
+    ) -> str | None:
+        if not bool(arguments.get("bilingual")):
+            return None
+        if source_language == "Chinese":
+            return "English"
+        if source_language == "English":
+            return "Chinese"
+        return None
+
+    def _infer_source_language_for_target(self, path: Path, *, series: bool) -> str | None:
+        candidate = self._first_source_file(path, series=series)
+        if candidate is None:
+            return None
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")[:12000]
+        except OSError:
+            return None
+        if re.search(r"[\u4e00-\u9fff]", text):
+            return "Chinese"
+        if re.search(r"[A-Za-z]", text):
+            return "English"
+        return None
+
+    def _first_source_file(self, path: Path, *, series: bool) -> Path | None:
+        if not series:
+            return path if path.exists() else None
+        suffixes = None
+        try:
+            files = discover_series_files(path, recursive=False, suffixes=suffixes)
+        except Exception:
+            return None
+        return files[0] if files else None
+
+    def _run_agent_loop(self, line: str) -> dict[str, Any]:
+        state = AgentLoopState(
+            original_user_message=line,
+            max_steps=AGENT_LOOP_MAX_STEPS,
+            current_mode=self.session.mode,
+            allowed_tools=tuple(tool["name"] for tool in self._tool_specs()),
+        )
+        trace = _AgentLoopTrace(console=self.console, interactive=self.interactive)
+        trace.start()
+        for _ in range(state.max_steps):
+            with trace.thinking():
+                decision = self._decide_loop_next_action(state, show_status=False)
+            state.steps.append(self._loop_step_from_decision(decision))
+            action = str(decision.get("action") or "").strip()
+
+            if action == "tool_call":
+                tool_name = str(decision.get("tool_name") or "").strip()
+                arguments = dict(decision.get("arguments") or {})
+                if tool_name not in DISCOVERY_TOOL_NAMES:
+                    final_decision = self._decision_from_final_tool_call(
+                        {
+                            **decision,
+                            "action": "final_tool_call",
+                            "tool_name": tool_name,
+                            "arguments": arguments,
+                        },
+                        original=line,
+                    )
+                    trace.final(final_decision)
+                    return final_decision
+                trace.tool(tool_name, arguments)
+                observation = self._run_discovery_tool_call(tool_name, arguments, original=line)
+                state.observations.append(observation)
+                trace.observe(observation.preview)
+                continue
+
+            if action == "final_tool_call":
+                final_decision = self._decision_from_final_tool_call(decision, original=line)
+                trace.final(final_decision)
+                return final_decision
+
+            if action in {"respond", "ask_user", "plan"}:
+                trace.final(decision)
+                return decision
+
+            raise ValueError(f"Unsupported agent loop action: {action or '<missing>'}")
+
+        message = f"Agent loop stopped after {state.max_steps} steps without a final action."
+        trace.observe(message)
+        return {"action": "respond", "message": message}
+
+    def _decide_loop_next_action(self, state: AgentLoopState, *, show_status: bool = True) -> dict[str, Any]:
+        backend = build_backend_from_values(self.values)
+        if backend is None:
+            raise RuntimeError("Agent conversation requires a model backend.")
+        messages = self._build_agent_loop_decision_messages(state)
+        if self.interactive and show_status:
+            with self.console.status("Model thinking...", spinner="dots"):
+                payload, _ = backend.generate_json(messages)
+        else:
+            payload, _ = backend.generate_json(messages)
+        if not isinstance(payload, dict):
+            raise ValueError("Agent loop decision must be a JSON object.")
+        action = str(payload.get("action") or "").strip()
+        if action not in {"respond", "ask_user", "tool_call", "final_tool_call", "plan"}:
+            raise ValueError(f"Unsupported agent loop decision action: {action or '<missing>'}")
+        return payload
+
+    def _build_agent_loop_decision_messages(self, state: AgentLoopState) -> list[dict[str, str]]:
+        context = {
+            **state.to_context(),
+            "user_message": state.original_user_message,
+            "mode": self.session.mode,
+            "profile": self.profile,
+            "cwd": str(self.cwd),
+            "project_root": str(self.project_root),
+            "references": self._reference_context(state.original_user_message),
+            "recent_events": self.session.events[-8:],
+            "tools": self._tool_specs(),
+        }
+        system_prompt = (
+            "You are SubBake's bounded local project agent.\n"
+            "Return valid JSON only.\n"
+            "Choose one action: respond, ask_user, tool_call, final_tool_call, or plan.\n"
+            "Use tool_call only for safe discovery tools: list_files, search_files, "
+            "recent_translations, candidate_subtitles, read_file_preview.\n"
+            "Use final_tool_call when enough evidence supports one executable tool.\n"
+            "Discovery before mutation is required when the target path is uncertain.\n"
+            "Never claim a file exists unless it is present in references or tool observations.\n"
+            "If multiple strong subtitle candidates remain, return ask_user with the choices.\n"
+            "In plan mode, discovery tools may run; executable final actions will be stored for approval.\n"
+        )
+        user_prompt = (
+            "TASK_START\n"
+            "agent_loop_decide\n"
+            "TASK_END\n"
+            'Return JSON with "action", "message", "reason", and "confidence" when applicable. '
+            'For tool_call or final_tool_call include "tool_name" and "arguments". '
+            'For plan include "tool_calls".\n'
+            "AGENT_LOOP_CONTEXT_JSON_START\n"
+            f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}\n"
+            "AGENT_LOOP_CONTEXT_JSON_END\n"
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def _loop_step_from_decision(self, decision: dict[str, Any]) -> AgentLoopStep:
+        confidence: float | None = None
+        raw_confidence = decision.get("confidence")
+        if isinstance(raw_confidence, int | float):
+            confidence = float(raw_confidence)
+        return AgentLoopStep(
+            action=str(decision.get("action") or ""),
+            tool_name=str(decision.get("tool_name") or "") or None,
+            arguments=dict(decision.get("arguments") or {}),
+            reason=str(decision.get("reason") or ""),
+            confidence=confidence,
+        )
+
+    def _decision_from_final_tool_call(self, decision: dict[str, Any], *, original: str) -> dict[str, Any]:
+        tool_name = str(decision.get("tool_name") or "").strip()
+        if not tool_name:
+            raise ValueError("Executable agent decision is missing tool_name.")
+        arguments = self._enrich_executable_arguments(
+            tool_name,
+            dict(decision.get("arguments") or {}),
+            original=original,
+        )
+        message = str(decision.get("message") or decision.get("reason") or "Executing tool.").strip()
+        if self.session.mode == "plan":
+            return {
+                "action": "plan",
+                "message": f"Plan:\n- {message}",
+                "tool_calls": [{"tool_name": tool_name, "arguments": arguments}],
+            }
+        return {
+            "action": "tool_call",
+            "message": message,
+            "tool_name": tool_name,
+            "arguments": arguments,
+        }
+
+    def _enrich_executable_arguments(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        original: str,
+    ) -> dict[str, Any]:
+        enriched = self._arguments_with_text_overrides(arguments, original)
+        if tool_name == "translate_file" and enriched.get("path"):
+            requested_path = self._resolve_user_path(str(enriched["path"]))
+            source_path = self._source_path_for_translation_reference(requested_path) or requested_path
+            enriched["path"] = str(source_path)
+            return self._translation_arguments_for_target(
+                path=source_path,
+                arguments=enriched,
+                series=False,
+            )
+        if tool_name == "translate_series" and enriched.get("path"):
+            requested_path = self._resolve_user_path(str(enriched["path"]))
+            enriched["path"] = str(requested_path)
+            return self._translation_arguments_for_target(
+                path=requested_path,
+                arguments=enriched,
+                series=True,
+            )
+        return enriched
+
+    def _run_discovery_tool_call(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        original: str,
+    ) -> AgentObservation:
+        if tool_name not in DISCOVERY_TOOL_NAMES:
+            raise ValueError(f"Agent loop discovery cannot run mutating tool: {tool_name}")
+
+        if tool_name == "list_files":
+            path = self._resolve_user_path(str(arguments.get("path") or "."))
+            recursive = self._bool_argument(arguments.get("recursive"), "recursive") or False
+            files = FileOperationGuard(project_root=self.project_root).list_files(path, recursive=recursive)
+            items = [
+                {
+                    "path": str(item.relative_to(self.project_root)),
+                    "kind": classify_candidate_path(item) or ("directory" if item.is_dir() else "file"),
+                    "suffix": item.suffix.lower(),
+                }
+                for item in files
+            ]
+            return AgentObservation(
+                tool_name=tool_name,
+                arguments={"path": str(path), "recursive": recursive},
+                preview=f"{len(items)} files",
+                data={"files": items},
+            )
+
+        if tool_name == "search_files":
+            path = self._resolve_user_path(str(arguments.get("path") or "."))
+            pattern = str(arguments.get("pattern") or arguments.get("query") or "").strip()
+            if not pattern:
+                pattern = self._search_pattern_from_text(original)
+            if not pattern:
+                return AgentObservation(
+                    tool_name=tool_name,
+                    arguments={"path": str(path), "pattern": pattern},
+                    preview="no search pattern",
+                    data={"pattern": pattern, "candidates": [], "matches": []},
+                )
+            candidates = self._rank_candidates_in_path(path, pattern, limit=20)
+            data: dict[str, Any] = {"pattern": pattern, "candidates": [candidate.to_dict() for candidate in candidates]}
+            if not candidates:
+                matches = FileOperationGuard(project_root=self.project_root).search_files(path, pattern)
+                data["matches"] = matches
+                preview = f"{len(matches)} text matches" if matches else "no matches"
+            else:
+                preview = self._candidate_observation_preview(candidates)
+            return AgentObservation(
+                tool_name=tool_name,
+                arguments={"path": str(path), "pattern": pattern},
+                preview=preview,
+                data=data,
+            )
+
+        if tool_name == "candidate_subtitles":
+            path = self._resolve_user_path(str(arguments.get("path") or "."))
+            query = str(arguments.get("query") or "").strip() or original
+            candidates = self._rank_candidates_in_path(path, query, limit=20)
+            return AgentObservation(
+                tool_name=tool_name,
+                arguments={"path": str(path), "query": query},
+                preview=self._candidate_observation_preview(candidates),
+                data={"query": query, "candidates": [candidate.to_dict() for candidate in candidates]},
+            )
+
+        if tool_name == "recent_translations":
+            records = self._recent_translation_records()
+            preview = (
+                f"{len(records)} recent translations: {records[0]['path']}"
+                if records
+                else "no recent translations"
+            )
+            return AgentObservation(
+                tool_name=tool_name,
+                arguments={},
+                preview=preview,
+                data={"translations": records},
+            )
+
+        if tool_name == "read_file_preview":
+            path = self._resolve_user_path(str(arguments.get("path") or ""))
+            limit = int(arguments.get("limit") or 2000)
+            text = FileOperationGuard(project_root=self.project_root).read_file(path, limit=limit)
+            return AgentObservation(
+                tool_name=tool_name,
+                arguments={"path": str(path), "limit": limit},
+                preview=f"preview {path.relative_to(self.project_root)} ({len(text)} chars)",
+                data={"path": str(path.relative_to(self.project_root)), "text": text},
+            )
+
+        raise ValueError(f"Unsupported discovery tool: {tool_name}")
+
+    def _format_discovery_observation_for_user(self, observation: AgentObservation) -> str:
+        if observation.tool_name == "list_files":
+            files = [
+                item.get("path")
+                for item in observation.data.get("files", [])
+                if isinstance(item, dict) and item.get("path")
+            ]
+            return "\n".join(str(path) for path in files)
+        if observation.tool_name in {"search_files", "candidate_subtitles"}:
+            candidates = [
+                FileCandidate(
+                    path=str(item.get("path") or ""),
+                    kind=str(item.get("kind") or ""),
+                    suffix=str(item.get("suffix") or ""),
+                    score=float(item.get("score") or 0),
+                    match_reason=str(item.get("match_reason") or ""),
+                    inferred_source_path=(
+                        str(item.get("inferred_source_path"))
+                        if item.get("inferred_source_path") is not None
+                        else None
+                    ),
+                )
+                for item in observation.data.get("candidates", [])
+                if isinstance(item, dict)
+            ]
+            if candidates:
+                return format_candidate_lines(candidates)
+            matches = observation.data.get("matches")
+            if isinstance(matches, list) and matches:
+                return "\n".join(str(match) for match in matches)
+            return "No matches."
+        if observation.tool_name == "recent_translations":
+            records = observation.data.get("translations", [])
+            if not isinstance(records, list) or not records:
+                return "No recent translations."
+            return "\n".join(
+                f"{record.get('tool_name')}: {record.get('path')}"
+                for record in records
+                if isinstance(record, dict)
+            )
+        if observation.tool_name == "read_file_preview":
+            return str(observation.data.get("text") or "")
+        return observation.preview
+
+    def _rank_candidates_in_path(self, path: Path, query: str, *, limit: int) -> list[FileCandidate]:
+        guard = FileOperationGuard(project_root=self.project_root)
+        files = guard.list_files(path, recursive=True, limit=500)
+        return rank_file_candidates(files, query, project_root=self.project_root, limit=limit)
+
+    def _candidate_observation_preview(self, candidates: list[FileCandidate]) -> str:
+        if not candidates:
+            return "no candidates"
+        strong = strong_subtitle_candidates(candidates)
+        if len(strong) == 1:
+            return f"selected {executable_subtitle_path(strong[0])}"
+        return f"{len(candidates)} candidates, top {candidates[0].path}"
+
+    def _recent_translation_records(self, *, limit: int = 5) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for event in reversed(self.session.events):
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+            if event.get("kind") == "translate_file" and data.get("input_path"):
+                records.append(
+                    {
+                        "tool_name": "translate_file",
+                        "path": str(data["input_path"]),
+                        "output_path": data.get("output_path"),
+                        "bilingual": bool(data.get("bilingual")),
+                        "source_language": data.get("source_language"),
+                        "target_language": data.get("target_language"),
+                    }
+                )
+            elif event.get("kind") == "series" and data.get("path"):
+                records.append(
+                    {
+                        "tool_name": "translate_series",
+                        "path": str(data["path"]),
+                        "suffixes": data.get("suffixes"),
+                        "recursive": data.get("recursive"),
+                        "bilingual": bool(data.get("bilingual")),
+                        "source_language": data.get("source_language"),
+                        "target_language": data.get("target_language"),
+                    }
+                )
+            if len(records) >= limit:
+                break
+        return records
+
     def _decide_next_action(self, line: str) -> dict[str, Any]:
         backend = build_backend_from_values(self.values)
         if backend is None:
             raise RuntimeError("Agent conversation requires a model backend.")
         messages = self._build_agent_decision_messages(line)
-        payload, _ = backend.generate_json(messages)
+        with self.console.status("Model thinking...", spinner="dots"):
+            payload, _ = backend.generate_json(messages)
         if not isinstance(payload, dict):
             raise ValueError("Agent decision must be a JSON object.")
         action = str(payload.get("action") or "").strip()
-        if action not in {"respond", "tool_call", "plan", "ask_user"}:
+        if action not in {"respond", "tool_call", "final_tool_call", "plan", "ask_user"}:
             raise ValueError(f"Unsupported agent decision action: {action or '<missing>'}")
         return payload
 
@@ -361,6 +994,9 @@ class SubBakeAgent:
 
     def _handle_decision(self, decision: dict[str, Any], *, original: str) -> None:
         action = decision["action"]
+        if action == "final_tool_call":
+            self._handle_decision(self._decision_from_final_tool_call(decision, original=original), original=original)
+            return
         if action == "respond":
             message = str(decision.get("message") or "")
             self.console.print(message or "Done.")
@@ -390,32 +1026,37 @@ class SubBakeAgent:
                     original=original,
                 )
                 return
+            tool_name = str(decision.get("tool_name") or "")
+            arguments = dict(decision.get("arguments") or {})
+            message = str(decision.get("message") or "").strip()
+            if message and not self._tool_prints_own_progress(tool_name):
+                self.console.print(message)
             result = self._run_tool_call(
-                str(decision.get("tool_name") or ""),
-                dict(decision.get("arguments") or {}),
+                tool_name,
+                arguments,
                 original=original,
             )
-            message = str(decision.get("message") or "").strip()
-            if message:
-                self.console.print(message)
             if result:
                 self.console.print(result)
             return
         raise ValueError(f"Unsupported agent decision action: {action}")
 
     def _run_tool_call(self, tool_name: str, arguments: dict[str, Any], *, original: str) -> str:
+        arguments = self._arguments_with_text_overrides(arguments, original)
         if tool_name == "translate_file":
             path = self._resolve_user_path(str(arguments.get("path") or ""))
-            self._translate_file(path, original=original)
+            self._translate_file(path, original=original, arguments=arguments)
             return ""
         if tool_name == "translate_series":
             path = self._resolve_user_path(str(arguments.get("path") or ""))
             self._translate_series_tool(
                 path,
                 original=original,
-                recursive=bool(arguments.get("recursive", False)),
-                overwrite=bool(arguments.get("overwrite", False)),
-                dry_run=bool(arguments.get("dry_run", False)),
+                recursive=self._bool_argument(arguments.get("recursive"), "recursive") or False,
+                overwrite=self._bool_argument(arguments.get("overwrite"), "overwrite") or False,
+                dry_run=self._bool_argument(arguments.get("dry_run"), "dry_run") or False,
+                suffixes=self._series_suffixes_from_argument(arguments.get("suffixes")),
+                arguments=arguments,
             )
             return ""
         if tool_name == "diagnose_path":
@@ -449,9 +1090,11 @@ class SubBakeAgent:
             files = guard.list_files(path, recursive=bool(arguments.get("recursive", False)))
             return "\n".join(str(item.relative_to(self.project_root)) for item in files)
         if tool_name == "search_files":
-            path = self._resolve_user_path(str(arguments.get("path") or "."))
-            pattern = str(arguments.get("pattern") or "")
-            return "\n".join(guard.search_files(path, pattern)) or "No matches."
+            observation = self._run_discovery_tool_call(tool_name, arguments, original=original)
+            return self._format_discovery_observation_for_user(observation)
+        if tool_name in {"recent_translations", "candidate_subtitles", "read_file_preview"}:
+            observation = self._run_discovery_tool_call(tool_name, arguments, original=original)
+            return self._format_discovery_observation_for_user(observation)
         if tool_name == "create_file":
             path = self._resolve_user_path(str(arguments.get("path") or ""))
             result = guard.create_file(path, str(arguments.get("content") or ""))
@@ -490,6 +1133,9 @@ class SubBakeAgent:
 
         raise ValueError(f"Unsupported agent tool: {tool_name or '<missing>'}")
 
+    def _tool_prints_own_progress(self, tool_name: str) -> bool:
+        return tool_name in {"translate_file", "translate_series"}
+
     def _translate_series_tool(
         self,
         path: Path,
@@ -498,20 +1144,30 @@ class SubBakeAgent:
         recursive: bool,
         overwrite: bool,
         dry_run: bool,
+        suffixes: set[str] | None,
+        arguments: dict[str, Any],
     ) -> None:
-        files = discover_series_files(path, recursive=recursive)
+        files = discover_series_files(path, recursive=recursive, suffixes=suffixes)
         if not files:
-            self.console.print("[bold yellow]No subtitle files found.[/bold yellow]")
-            self._record_event("series_empty", original, {"path": str(path)})
+            suffix_label = ", ".join(sorted(suffixes)) if suffixes else "subtitle"
+            self.console.print(f"[bold yellow]No {suffix_label} files found.[/bold yellow]")
+            self._record_event("series_empty", original, {"path": str(path), "suffixes": sorted(suffixes) if suffixes else None})
             return
+        values = self._translation_values_for_tool(arguments)
+        if dry_run:
+            values["dry_run"] = True
+        self._print_translation_start(
+            original=original,
+            values=values,
+            file_count=len(files),
+            suffixes={file_path.suffix.lower() for file_path in files},
+            series=True,
+        )
         self.console.print(
             "[bold green]Series:[/bold green] "
             f"{len(files)} file(s), profile={self.profile or 'default'}, "
-            f"target={self.values['target_language']}"
+            f"target={values['target_language']}"
         )
-        values = dict(self.values)
-        if dry_run:
-            values["dry_run"] = True
         result = translate_series(
             root=path,
             values=values,
@@ -519,8 +1175,10 @@ class SubBakeAgent:
             console=self.console,
             recursive=recursive,
             overwrite=overwrite,
+            suffixes=suffixes,
         )
         self._print_series_summary(result)
+        self._print_series_completion(result)
         self._record_event(
             "series",
             original,
@@ -529,6 +1187,12 @@ class SubBakeAgent:
                 "processed": result.processed_count,
                 "skipped": result.skipped_count,
                 "failures": result.failure_count,
+                "suffixes": sorted(suffixes) if suffixes else None,
+                "recursive": recursive,
+                "bilingual": bool(values["bilingual"]),
+                "source_language": str(values["source_language"]),
+                "target_language": str(values["target_language"]),
+                "output_format": values.get("output_format"),
             },
         )
 
@@ -597,14 +1261,46 @@ class SubBakeAgent:
 
     def _tool_specs(self) -> list[dict[str, Any]]:
         return [
-            {"name": "translate_file", "mutating": True, "args": ["path"]},
-            {"name": "translate_series", "mutating": True, "args": ["path", "recursive", "overwrite", "dry_run"]},
+            {
+                "name": "translate_file",
+                "mutating": True,
+                "args": [
+                    "path",
+                    "bilingual",
+                    "target_language",
+                    "source_language",
+                    "output_format",
+                    "dry_run",
+                    "fast",
+                    "final_review",
+                ],
+            },
+            {
+                "name": "translate_series",
+                "mutating": True,
+                "args": [
+                    "path",
+                    "recursive",
+                    "overwrite",
+                    "dry_run",
+                    "suffixes",
+                    "bilingual",
+                    "target_language",
+                    "source_language",
+                    "output_format",
+                    "fast",
+                    "final_review",
+                ],
+            },
             {"name": "edit_subtitle", "mutating": True, "args": ["path", "instruction"]},
             {"name": "diagnose_path", "mutating": False, "args": ["path"]},
             {"name": "diagnose_text", "mutating": False, "args": ["text"]},
             {"name": "read_file", "mutating": False, "args": ["path"]},
             {"name": "list_files", "mutating": False, "args": ["path", "recursive"]},
             {"name": "search_files", "mutating": False, "args": ["path", "pattern"]},
+            {"name": "recent_translations", "mutating": False, "args": []},
+            {"name": "candidate_subtitles", "mutating": False, "args": ["path", "query"]},
+            {"name": "read_file_preview", "mutating": False, "args": ["path", "limit"]},
             {"name": "create_file", "mutating": True, "args": ["path", "content"]},
             {"name": "append_file", "mutating": True, "args": ["path", "content"]},
             {"name": "replace_in_file", "mutating": True, "args": ["path", "old", "new"]},
@@ -621,6 +1317,218 @@ class SubBakeAgent:
         if not path.is_absolute():
             path = self.cwd / path
         return path
+
+    def _series_suffixes_from_argument(self, value: object) -> set[str] | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            raw_suffixes = [value]
+        elif isinstance(value, (list, tuple, set)):
+            raw_suffixes = [str(item) for item in value]
+        else:
+            raise ValueError("Series suffixes must be a string or list of strings.")
+
+        suffixes = {f".{suffix.strip().lower().lstrip('.')}" for suffix in raw_suffixes if suffix.strip()}
+        unsupported = suffixes - SUPPORTED_SUBTITLE_SUFFIXES
+        if unsupported:
+            names = ", ".join(sorted(unsupported))
+            raise ValueError(f"Unsupported series input suffix: {names}")
+        return suffixes or None
+
+    def _arguments_with_text_overrides(self, arguments: dict[str, Any], original: str) -> dict[str, Any]:
+        merged = {key: value for key, value in arguments.items() if value is not None}
+        merged.update(self._translation_arguments_from_text(original))
+        return merged
+
+    def _translation_values_for_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        values = dict(self.values)
+        boolean_keys = {"bilingual", "dry_run", "fast", "final_review", "resume", "cache", "agent"}
+        for key in boolean_keys:
+            if key in arguments:
+                parsed = self._bool_argument(arguments[key], key)
+                if parsed is not None:
+                    values[key] = parsed
+
+        for key in ("source_language", "target_language"):
+            value = arguments.get(key)
+            if value is not None and str(value).strip():
+                values[key] = str(value).strip()
+
+        output_format = self._output_format_from_argument(arguments.get("output_format"))
+        if output_format is not None:
+            values["output_format"] = output_format
+        return values
+
+    def _bool_argument(self, value: object, name: str) -> bool | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().casefold()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+        raise ValueError(f"Tool argument {name} must be a boolean.")
+
+    def _output_format_from_argument(self, value: object) -> str | None:
+        if value is None or value == "":
+            return None
+        output_format = str(value).strip().lower().lstrip(".")
+        if f".{output_format}" not in SUPPORTED_SUBTITLE_SUFFIXES:
+            raise ValueError(f"Unsupported output format: {output_format}")
+        return output_format
+
+    def _translation_arguments_from_text(self, line: str) -> dict[str, Any]:
+        lowered = line.casefold()
+        arguments: dict[str, Any] = {}
+
+        suffixes = self._series_suffixes_from_text(line)
+        if suffixes is not None:
+            arguments["suffixes"] = sorted(suffixes)
+        if any(word in lowered for word in ("递归", "子目录", "recursive", "subdir")):
+            arguments["recursive"] = True
+        if any(word in lowered for word in ("覆盖", "重新翻译", "overwrite", "retranslate")):
+            arguments["overwrite"] = True
+        if any(word in lowered for word in ("dry run", "dry-run", "只规划", "预览")):
+            arguments["dry_run"] = True
+        if any(word in lowered for word in ("快速", "fast mode", "fast")):
+            arguments["fast"] = True
+        if any(word in lowered for word in ("不要复核", "不复核", "no final review", "without final review")):
+            arguments["final_review"] = False
+        if self._monolingual_requested(line):
+            arguments["bilingual"] = False
+        elif self._bilingual_requested(line):
+            arguments["bilingual"] = True
+
+        source_language = self._source_language_from_text(line)
+        if source_language is not None:
+            arguments["source_language"] = source_language
+        target_language = self._target_language_from_text(line, source_language=source_language)
+        if target_language is not None:
+            arguments["target_language"] = target_language
+        output_format = self._output_format_from_text(line)
+        if output_format is not None:
+            arguments["output_format"] = output_format
+        return arguments
+
+    def _bilingual_requested(self, line: str) -> bool:
+        lowered = line.casefold()
+        return any(word in lowered for word in ("双语", "中英", "bilingual", "dual-language", "dual language"))
+
+    def _monolingual_requested(self, line: str) -> bool:
+        lowered = line.casefold()
+        return any(word in lowered for word in ("不要双语", "非双语", "单语", "only translation", "translation only"))
+
+    def _target_language_from_text(self, line: str, *, source_language: str | None = None) -> str | None:
+        lowered = line.casefold()
+        explicit = re.search(r"(?:target(?: language)?|目标语言)\s*[:=：]\s*([a-zA-Z][a-zA-Z_-]*)", line)
+        if explicit is not None:
+            return explicit.group(1)
+        for phrase, language in _language_phrases():
+            if re.search(rf"(?:翻译|译|translate).{{0,12}}(?:成|到|为|to)\s*{re.escape(phrase)}", lowered):
+                return language
+            if re.search(rf"(?:译成|翻成)\s*{re.escape(phrase)}", lowered):
+                return language
+        return self._target_language_for_bilingual_pair(line, source_language=source_language)
+
+    def _source_language_from_text(self, line: str) -> str | None:
+        lowered = line.casefold()
+        explicit = re.search(r"(?:source(?: language)?|源语言)\s*[:=：]\s*([a-zA-Z][a-zA-Z_-]*)", line)
+        if explicit is not None:
+            return explicit.group(1)
+        if any(word in lowered for word in ("中文字幕", "中文源字幕", "中文原字幕", "原文中文")):
+            return "Chinese"
+        if any(word in lowered for word in ("英文字幕", "英语字幕", "英文源字幕", "英文原字幕", "原文英文", "原文英语")):
+            return "English"
+        for phrase, language in _language_phrases():
+            if re.search(rf"(?:从|from\s+)\s*{re.escape(phrase)}", lowered):
+                return language
+        return None
+
+    def _target_language_for_bilingual_pair(
+        self,
+        line: str,
+        *,
+        source_language: str | None,
+    ) -> str | None:
+        lowered = line.casefold()
+        if any(word in lowered for word in ("中英", "中文英文", "chinese english", "chinese-english")):
+            if source_language == "Chinese":
+                return "English"
+            if source_language == "English":
+                return "Chinese"
+        if any(word in lowered for word in ("英中", "英文中文", "english chinese", "english-chinese")):
+            if source_language == "English":
+                return "Chinese"
+            if source_language == "Chinese":
+                return "English"
+        return None
+
+    def _output_format_from_text(self, line: str) -> str | None:
+        lowered = line.casefold()
+        for pattern in _output_format_patterns():
+            match = re.search(pattern, lowered)
+            if match is not None:
+                return match.group(1)
+        return None
+
+    def _line_without_output_format_phrases(self, line: str) -> str:
+        cleaned = line.casefold()
+        for pattern in _output_format_patterns():
+            cleaned = re.sub(pattern, " ", cleaned)
+        return cleaned
+
+    def _print_translation_start(
+        self,
+        *,
+        original: str,
+        values: dict[str, Any],
+        file_count: int,
+        suffixes: set[str],
+        series: bool,
+        path: Path | None = None,
+    ) -> None:
+        action = "规划" if bool(values["dry_run"]) else "翻译"
+        subject = path.name if path is not None else self._file_count_label(file_count, suffixes)
+        render_label = self._render_mode_label(original, values)
+        scope = "同一系列" if series else "这个文件"
+        self.console.print(f"[bold green]Preparing:[/bold green] 现在要按{scope}{action} {subject}，{render_label}。")
+
+    def _print_file_completion(self, *, output_path: Path | None, dry_run: bool) -> None:
+        if dry_run:
+            self.console.print("[bold green]Completed:[/bold green] 已完成翻译规划。")
+            return
+        self.console.print(f"[bold green]Completed:[/bold green] 已完成翻译，输出 {output_path}。")
+
+    def _print_series_completion(self, result) -> None:
+        if result.failure_count:
+            self.console.print(
+                "[bold yellow]Completed:[/bold yellow] "
+                f"已完成 {result.processed_count} 个，跳过 {result.skipped_count} 个，失败 {result.failure_count} 个。"
+            )
+            return
+        self.console.print(
+            "[bold green]Completed:[/bold green] "
+            f"已完成 {result.processed_count} 个文件翻译，跳过 {result.skipped_count} 个。"
+        )
+
+    def _file_count_label(self, file_count: int, suffixes: set[str]) -> str:
+        suffix_label = ", ".join(sorted(suffixes))
+        if suffix_label:
+            return f"{file_count} 个 {suffix_label} 文件"
+        return f"{file_count} 个字幕文件"
+
+    def _render_mode_label(self, original: str, values: dict[str, Any]) -> str:
+        if bool(values["bilingual"]):
+            base_label = "生成中英双语字幕" if "中英" in original else "生成双语字幕"
+            label = f"{base_label}，目标语言 {values['target_language']}"
+        else:
+            label = f"目标语言 {values['target_language']}"
+        output_format = values.get("output_format")
+        if output_format is not None:
+            label = f"{label}，输出 {str(output_format).upper()} 格式"
+        return label
 
     def _store_plan(self, decision: dict[str, Any], *, original: str) -> None:
         tool_calls = [
@@ -685,10 +1593,18 @@ class SubBakeAgent:
         self.console.print("[bold green]Pending plan discarded.[/bold green]")
         self._record_event("reject", "/reject")
 
-    def _translate_file(self, path: Path, *, original: str) -> None:
+    def _translate_file(self, path: Path, *, original: str, arguments: dict[str, Any] | None = None) -> None:
         if not path.exists():
             raise FileNotFoundError(f"Subtitle file not found: {path}")
-        values = dict(self.values)
+        values = self._translation_values_for_tool(arguments or {})
+        self._print_translation_start(
+            original=original,
+            values=values,
+            file_count=1,
+            suffixes={path.suffix.lower()},
+            series=False,
+            path=path,
+        )
         backend = build_backend_from_values(values)
         options = build_pipeline_options(
             input_path=path,
@@ -702,14 +1618,20 @@ class SubBakeAgent:
         ).run()
         if result.dry_run:
             self.console.print(f"[bold yellow]Dry run:[/bold yellow] {len(result.planned_batches)} batch(es) planned.")
+            self._print_file_completion(output_path=None, dry_run=True)
         else:
             self.console.print(f"[bold green]Output:[/bold green] {result.output_path}")
+            self._print_file_completion(output_path=result.output_path, dry_run=False)
         self._record_event(
             "translate_file",
             original,
             {
                 "input_path": str(path),
                 "output_path": str(result.output_path) if result.output_path else None,
+                "bilingual": bool(values["bilingual"]),
+                "source_language": str(values["source_language"]),
+                "target_language": str(values["target_language"]),
+                "output_format": values.get("output_format"),
             },
         )
 
@@ -1257,6 +2179,108 @@ class SubBakeAgent:
         command, _, rest = line.partition(" ")
         return command.lower(), rest
 
+
+class _AgentLoopTrace:
+    TRACE_STYLES = {
+        "THINK": "dim",
+        "TOOL": "bold yellow",
+        "OBSERVE": "green",
+        "EXECUTE": "bold green",
+        "PLAN": "bold cyan",
+        "FINAL": "bold green",
+    }
+
+    def __init__(self, *, console: Console, interactive: bool) -> None:
+        self.console = console
+        self.interactive = interactive
+        self.started = False
+
+    def start(self) -> None:
+        if self.started:
+            return
+        self.started = True
+        if self.interactive:
+            header = Text()
+            header.append("Agent Loop", style="bold cyan")
+            header.append("  bounded discovery", style="dim")
+            self.console.print(header)
+            return
+        self.console.print("Agent Loop")
+
+    @contextmanager
+    def thinking(self) -> Iterator[None]:
+        if self.interactive:
+            with self.console.status("THINK model deciding", spinner="dots"):
+                yield
+            self.think()
+            return
+        self.think()
+        yield
+
+    def think(self) -> None:
+        self._emit("THINK model deciding")
+
+    def tool(self, tool_name: str, arguments: dict[str, Any]) -> None:
+        suffix = _trace_arguments(arguments)
+        self._emit(f"TOOL {tool_name}{suffix}")
+
+    def observe(self, preview: str) -> None:
+        self._emit(f"OBSERVE {preview}")
+
+    def final(self, decision: dict[str, Any]) -> None:
+        action = str(decision.get("action") or "")
+        if action == "tool_call":
+            tool_name = str(decision.get("tool_name") or "")
+            suffix = _trace_arguments(dict(decision.get("arguments") or {}), include_modes=True)
+            self._emit(f"EXECUTE {tool_name}{suffix}")
+            return
+        if action == "plan":
+            tool_calls = [call for call in decision.get("tool_calls") or [] if isinstance(call, dict)]
+            if tool_calls:
+                first = tool_calls[0]
+                tool_name = str(first.get("tool_name") or "")
+                suffix = _trace_arguments(dict(first.get("arguments") or {}), include_modes=True)
+                self._emit(f"PLAN {tool_name}{suffix}")
+                return
+        self._emit(f"FINAL {action or 'respond'}")
+
+    def _emit(self, line: str) -> None:
+        if not self.interactive:
+            self.console.print(line)
+            return
+
+        label, _, detail = line.partition(" ")
+        row = Text("  ")
+        row.append("| ", style="dim")
+        row.append(label, style=self.TRACE_STYLES.get(label, "bold"))
+        if detail:
+            row.append(" ")
+            row.append(detail)
+        self.console.print(row)
+
+
+def _trace_arguments(arguments: dict[str, Any], *, include_modes: bool = False) -> str:
+    parts: list[str] = []
+    for key in ("path", "old_path", "new_path", "query", "pattern"):
+        value = arguments.get(key)
+        if value is None or value == "":
+            continue
+        parts.append(_trace_value(str(value)))
+    if include_modes:
+        if arguments.get("bilingual") is True:
+            parts.append("bilingual")
+        output_format = arguments.get("output_format")
+        if output_format:
+            parts.append(f"output={output_format}")
+    return "" if not parts else " " + " ".join(parts)
+
+
+def _trace_value(value: str) -> str:
+    if re.search(r"\s", value):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
 def start_interactive_agent(*, console: Console, resume: bool = False) -> None:
     SubBakeAgent(console=console, resume=resume).run()
 
@@ -1579,6 +2603,63 @@ def _text_prompt_matches(query: str, completions: tuple[str, ...]) -> list[str]:
     if not normalized:
         return list(completions)
     return [value for value in completions if value.casefold().startswith(normalized)]
+
+
+def _language_phrases() -> tuple[tuple[str, str], ...]:
+    return (
+        ("简体中文", "Chinese"),
+        ("中文", "Chinese"),
+        ("汉语", "Chinese"),
+        ("chinese", "Chinese"),
+        ("zh-cn", "Chinese"),
+        ("zh", "Chinese"),
+        ("繁体中文", "Traditional Chinese"),
+        ("traditional chinese", "Traditional Chinese"),
+        ("英文", "English"),
+        ("英语", "English"),
+        ("english", "English"),
+        ("en", "English"),
+        ("日文", "Japanese"),
+        ("日语", "Japanese"),
+        ("japanese", "Japanese"),
+        ("ja", "Japanese"),
+        ("韩文", "Korean"),
+        ("韩语", "Korean"),
+        ("korean", "Korean"),
+        ("ko", "Korean"),
+        ("法文", "French"),
+        ("法语", "French"),
+        ("french", "French"),
+        ("fr", "French"),
+        ("德文", "German"),
+        ("德语", "German"),
+        ("german", "German"),
+        ("de", "German"),
+        ("西班牙文", "Spanish"),
+        ("西班牙语", "Spanish"),
+        ("spanish", "Spanish"),
+        ("es", "Spanish"),
+        ("葡萄牙文", "Portuguese"),
+        ("葡萄牙语", "Portuguese"),
+        ("portuguese", "Portuguese"),
+        ("pt", "Portuguese"),
+        ("俄文", "Russian"),
+        ("俄语", "Russian"),
+        ("russian", "Russian"),
+        ("ru", "Russian"),
+        ("意大利文", "Italian"),
+        ("意大利语", "Italian"),
+        ("italian", "Italian"),
+        ("it", "Italian"),
+    )
+
+
+def _output_format_patterns() -> tuple[str, ...]:
+    return (
+        r"(?:输出|生成|保存|导出|产出).{0,12}\.?(srt|vtt|txt)(?:\s*格式|\s*文件|\s*字幕)?",
+        r"\.?(srt|vtt|txt).{0,8}(?:格式|输出)",
+        r"(?:output|export|save).{0,12}\.?(srt|vtt|txt)\b",
+    )
 
 
 def _resolve_text_prompt_value(raw_value: str, *, default: str) -> str:

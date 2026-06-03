@@ -4,6 +4,25 @@ This file tracks notable changes for each release.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-03
+
+### Added
+
+- The interactive agent now gives a concrete pre-flight message before starting translation work, including file count, input suffixes, render mode, target language, and output format when known.
+- The agent now prints a completion message after file and series translation runs.
+- Natural-language series requests can now target the current directory, filter input files by explicit subtitle suffixes such as `.srt`, and pass explicit translation options including bilingual output, target/source language, output format, recursive mode, overwrite, dry run, fast mode, and final-review control.
+- The agent can retarget recent or referenced generated subtitle outputs, such as changing a mistaken Chinese-only translation into Chinese-English bilingual subtitles without requiring the user to repeat the source path.
+- The agent can now retarget a previous translation by title text, such as `The Matrix Revolutions`, when the matching subtitle file is in the current directory.
+- Title matching and file search now expand known cross-language movie title aliases, such as `黑客帝国` to `The Matrix`.
+
+### Fixed
+
+- Translation tool-call messages are now shown before non-translation tools execute, while translation tools provide their own richer progress wording before the Rich dashboard appears.
+- Requests such as `生成 txt 格式` no longer cause the current-directory series detector to treat `.txt` as an input-file filter.
+- Referencing a generated subtitle such as `episode.translated.srt` in a retargeting request now resolves back to the source subtitle before rerendering.
+- Agent file search now matches file names as well as file contents, and common search requests are parsed locally instead of relying on model-provided search patterns.
+- The interactive agent startup banner now includes the package version.
+
 ## [0.4.0] - 2026-06-03
 
 ### Added
