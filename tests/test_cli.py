@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from click.core import ParameterSource
 from prompt_toolkit.document import Document
 from rich.console import Console
 from typer.testing import CliRunner
@@ -28,7 +29,8 @@ from subbake.agent import (
     _text_prompt_matches,
     _unique_slash_command_match,
 )
-from subbake.app import app
+
+from subbake.app import _configured_value, app
 from subbake.config import load_app_config
 from subbake.entities import Usage
 from subbake.models.base_model import LLMBackend
@@ -89,6 +91,54 @@ class CLITestCase(unittest.TestCase):
                 yield tmpdir
             finally:
                 os.chdir(old_cwd)
+
+    def test_configured_value_keeps_changed_cli_value_when_parameter_source_is_unreliable(self) -> None:
+        class DummyParameter:
+            name = "target_language"
+            default = "Chinese"
+
+        class DummyCommand:
+            params = [DummyParameter()]
+
+        class DummyContext:
+            command = DummyCommand()
+
+            def get_parameter_source(self, parameter_name: str):
+                return None
+
+        value = _configured_value(
+            DummyContext(),
+            "target_language",
+            "zh",
+            {"target_language": "en"},
+        )
+
+        self.assertEqual(value, "zh")
+
+    def test_configured_value_accepts_dashed_parameter_source_names(self) -> None:
+        class DummyParameter:
+            name = "target_language"
+            default = "Chinese"
+
+        class DummyCommand:
+            params = [DummyParameter()]
+
+        class DummyContext:
+            command = DummyCommand()
+
+            def get_parameter_source(self, parameter_name: str):
+                if parameter_name == "target-language":
+                    return ParameterSource.COMMANDLINE
+                return None
+
+        value = _configured_value(
+            DummyContext(),
+            "target_language",
+            "Chinese",
+            {"target_language": "en"},
+        )
+
+        self.assertEqual(value, "Chinese")
 
     def test_agent_slash_command_completer_filters_commands(self) -> None:
         completer = _slash_command_completer()

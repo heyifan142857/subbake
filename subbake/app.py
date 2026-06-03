@@ -143,9 +143,35 @@ def _configured_value(
     current_value: object,
     config_values: dict[str, object],
 ) -> object:
-    if ctx.get_parameter_source(parameter_name) == ParameterSource.COMMANDLINE:
+    if _is_commandline_value(ctx, parameter_name, current_value):
         return current_value
     return config_values.get(parameter_name, current_value)
+
+
+def _is_commandline_value(ctx: typer.Context, parameter_name: str, current_value: object) -> bool:
+    if _parameter_source_is_commandline(ctx, parameter_name):
+        return True
+
+    dashed_parameter_name = parameter_name.replace("_", "-")
+    if dashed_parameter_name != parameter_name and _parameter_source_is_commandline(ctx, dashed_parameter_name):
+        return True
+
+    option_default = _command_option_default(ctx, parameter_name)
+    return option_default is not _MISSING and current_value != option_default
+
+
+_MISSING = object()
+
+
+def _command_option_default(ctx: typer.Context, parameter_name: str) -> object:
+    for parameter in ctx.command.params:
+        if getattr(parameter, "name", None) == parameter_name:
+            return getattr(parameter, "default", _MISSING)
+    return _MISSING
+
+
+def _parameter_source_is_commandline(ctx: typer.Context, parameter_name: str) -> bool:
+    return ctx.get_parameter_source(parameter_name) == ParameterSource.COMMANDLINE
 
 
 def _resolve_translation_values(
