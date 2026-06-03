@@ -719,6 +719,24 @@ class CLITestCase(unittest.TestCase):
             self.assertEqual(len(backups), 1)
             self.assertIn("updated line", backups[0].read_text(encoding="utf-8"))
 
+    def test_agent_can_list_current_project_directory(self) -> None:
+        with self._isolated_filesystem():
+            Path("visible.txt").write_text("hello\n", encoding="utf-8")
+            Path("notes").mkdir()
+            Path(".git").mkdir()
+            Path(".venv").mkdir()
+
+            result = self.runner.invoke(app, [], input="你能看到当前目录有什么吗\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Listing files.", output)
+            self.assertIn("visible.txt", output)
+            self.assertIn("notes", output)
+            self.assertNotIn(".git", output)
+            self.assertNotIn(".venv", output)
+            self.assertNotIn(".subbake", output)
+
     def test_agent_file_operations_refuse_paths_outside_project(self) -> None:
         with self._isolated_filesystem():
             Path("subbake.toml").write_text(

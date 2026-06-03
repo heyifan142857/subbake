@@ -297,6 +297,12 @@ class SubBakeAgent:
                 {"path": str(references[0]), "content": self._content_after_references(line)},
                 "Creating file.",
             )
+        if (
+            not references
+            and any(word in lowered for word in ("当前目录", "目录下", "current directory", "cwd"))
+            and any(word in lowered for word in ("有什么", "列", "查看", "读取", "list", "show", "read"))
+        ):
+            return decision("list_files", {"path": ".", "recursive": False}, "Listing files.")
         return None
 
     def _content_after_references(self, line: str) -> str:

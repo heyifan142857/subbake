@@ -39,33 +39,28 @@ class FileOperationGuard:
         return f"{text[:limit]}\n...[truncated]"
 
     def list_files(self, path: Path, *, recursive: bool = False, limit: int = 200) -> list[Path]:
-        safe_path = self._resolve_safe_path(path)
+        safe_path = self._resolve_safe_path(path, allow_project_root=True)
         if not safe_path.exists():
             raise FileNotFoundError(f"Path not found: {safe_path}")
         if safe_path.is_file():
             return [safe_path]
-        iterator = safe_path.rglob("*") if recursive else safe_path.iterdir()
         results: list[Path] = []
-        for item in iterator:
+        for item in self._iter_safe_children(safe_path, recursive=recursive):
             if len(results) >= limit:
                 break
-            try:
-                self._resolve_safe_path(item)
-            except ValueError:
-                continue
             results.append(item)
         return sorted(results)
 
     def search_files(self, path: Path, pattern: str, *, limit: int = 50) -> list[str]:
         if not pattern:
             raise ValueError("Search pattern cannot be empty.")
-        safe_path = self._resolve_safe_path(path)
+        safe_path = self._resolve_safe_path(path, allow_project_root=True)
         if not safe_path.exists():
             raise FileNotFoundError(f"Path not found: {safe_path}")
         files = [safe_path] if safe_path.is_file() else [
             item
-            for item in safe_path.rglob("*")
-            if item.is_file() and not self._is_protected(item)
+            for item in self._iter_safe_children(safe_path, recursive=True)
+            if item.is_file()
         ]
         matches: list[str] = []
         expression = re.compile(re.escape(pattern), re.IGNORECASE)
@@ -137,9 +132,9 @@ class FileOperationGuard:
             raise ValueError(f"Refusing to edit a non-UTF-8 text file: {safe_path}") from exc
         return safe_path
 
-    def _resolve_safe_path(self, path: Path) -> Path:
+    def _resolve_safe_path(self, path: Path, *, allow_project_root: bool = False) -> Path:
         resolved = path.resolve()
-        if resolved == self.project_root:
+        if resolved == self.project_root and not allow_project_root:
             raise ValueError("Path must point to a file or child path, not the project root.")
         if self.project_root not in (resolved, *resolved.parents):
             raise ValueError(f"Path is outside the project root: {resolved}")
@@ -156,6 +151,22 @@ class FileOperationGuard:
         except ValueError:
             return True
         return False
+
+    def _iter_safe_children(self, path: Path, *, recursive: bool) -> list[Path]:
+        if not recursive:
+            return [item for item in path.iterdir() if not self._is_protected(item)]
+
+        results: list[Path] = []
+        pending = [path]
+        while pending:
+            current = pending.pop()
+            for item in current.iterdir():
+                if self._is_protected(item):
+                    continue
+                results.append(item)
+                if item.is_dir() and not item.is_symlink():
+                    pending.append(item)
+        return results
 
     def _backup_path(self, path: Path) -> Path:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
