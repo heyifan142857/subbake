@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -77,6 +79,16 @@ class CliAgentRepairBackend(LLMBackend):
 class CLITestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = CliRunner()
+
+    @contextlib.contextmanager
+    def _isolated_filesystem(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                yield tmpdir
+            finally:
+                os.chdir(old_cwd)
 
     def test_agent_slash_command_completer_filters_commands(self) -> None:
         completer = _slash_command_completer()
@@ -164,7 +176,7 @@ class CLITestCase(unittest.TestCase):
         self.assertIn("sbake clean input.srt", output)
 
     def test_bare_sbake_starts_agent_and_can_exit(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             result = self.runner.invoke(app, [], input="/exit\n")
             output = self._strip_ansi(result.stdout)
 
@@ -173,7 +185,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("sbake[", output)
 
     def test_agent_model_command_switches_config_profile(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 "[profiles.alpha]\n"
                 'provider = "mock"\n'
@@ -192,7 +204,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("mock / mock-beta", output)
 
     def test_agent_model_command_lists_profiles_in_non_interactive_mode(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 "[profiles.alpha]\n"
                 'provider = "mock"\n'
@@ -213,7 +225,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("new: create a new model profile", output)
 
     def test_agent_session_command_lists_session_titles(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             result = self.runner.invoke(app, [], input="hello session\n/session\n/exit\n")
             output = self._strip_ansi(result.stdout)
 
@@ -222,7 +234,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("hello session", output)
 
     def test_agent_session_command_switches_by_id(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             first = self.runner.invoke(app, [], input="first session\n/exit\n")
             self.assertEqual(first.exit_code, 0)
             session_files = sorted(Path(".subbake/agent/sessions").glob("*.json"))
@@ -236,7 +248,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("first session", output)
 
     def test_agent_profile_new_is_interactive_only_from_scripted_input(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             result = self.runner.invoke(app, [], input="/profile new\n/exit\n")
             output = self._strip_ansi(result.stdout)
 
@@ -244,7 +256,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("Profile creation is available from the interactive /profile picker.", output)
 
     def test_agent_offers_config_bootstrap_when_interactive_without_config(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             with (
                 patch("subbake.agent.discover_config_path", return_value=None),
                 patch("subbake.agent.discover_project_config_path", return_value=None),
@@ -262,7 +274,7 @@ class CLITestCase(unittest.TestCase):
             create_profile.assert_called_once()
 
     def test_agent_can_create_first_config_profile(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             config_path = Path("xdg/subbake/config.toml")
             with (
                 patch("subbake.agent.discover_config_path", return_value=None),
@@ -284,7 +296,7 @@ class CLITestCase(unittest.TestCase):
             self.assertEqual(config.profiles["chatgpt"]["api_key_env"], "OPENAI_API_KEY")
 
     def test_agent_created_profile_uses_current_config_when_present(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             config_path = Path("subbake.toml")
             config_path.write_text("[defaults]\nprovider = \"mock\"\n", encoding="utf-8")
             agent = SubBakeAgent(console=Console(record=True), resume=False)
@@ -300,7 +312,7 @@ class CLITestCase(unittest.TestCase):
             self.assertEqual(config.profiles["local"]["provider"], "mock")
 
     def test_agent_created_profile_does_not_replace_existing_default(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             config_path = Path("subbake.toml")
             config_path.write_text(
                 'default_profile = "alpha"\n\n'
@@ -320,7 +332,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("beta", config.profiles)
 
     def test_agent_new_profile_cancellation_does_not_write_config(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             config_path = Path("xdg/subbake/config.toml")
             with (
                 patch("subbake.agent.discover_config_path", return_value=None),
@@ -336,7 +348,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIsNone(agent.profile)
 
     def test_resume_command_starts_agent_when_no_session_exists(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             result = self.runner.invoke(app, ["resume"], input="/exit\n")
             output = self._strip_ansi(result.stdout)
 
@@ -385,7 +397,7 @@ class CLITestCase(unittest.TestCase):
             self.assertFalse(runtime_root.exists())
 
     def test_translate_uses_auto_discovered_config_profile(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 'default_profile = "mock_en"\n\n'
                 "[defaults]\n"
@@ -409,7 +421,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("profile mock_en", output)
 
     def test_translate_command_line_overrides_config_values(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 'default_profile = "mock_en"\n\n'
                 "[profiles.mock_en]\n"
@@ -430,7 +442,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("[MOCK-ZH] hello", Path("clip.translated.txt").read_text(encoding="utf-8"))
 
     def test_translate_requires_default_profile_when_multiple_profiles_exist(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 "[profiles.mock_en]\n"
                 'provider = "mock"\n'
@@ -452,7 +464,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("--profile", output)
 
     def test_translate_profile_option_selects_named_profile(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 "[profiles.mock_en]\n"
                 'provider = "mock"\n'
@@ -477,7 +489,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("[MOCK-ZH] hello", Path("clip.translated.txt").read_text(encoding="utf-8"))
 
     def test_translate_can_convert_output_format_from_output_suffix(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("clip.srt").write_text(
                 "1\n"
                 "00:00:01,000 --> 00:00:02,000\n"
@@ -505,7 +517,7 @@ class CLITestCase(unittest.TestCase):
             self.assertEqual(Path("converted.txt").read_text(encoding="utf-8"), "[MOCK-ZH] hello\n")
 
     def test_translate_reports_when_previous_results_are_reused(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("clip.txt").write_text("hello\nworld\n", encoding="utf-8")
 
             first_result = self.runner.invoke(
@@ -525,7 +537,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("1 translated batch(es) from resume", output)
 
     def test_translate_reports_agent_summary_and_log_path_when_triggered(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("clip.txt").write_text("hello\n", encoding="utf-8")
 
             with patch("subbake.app.build_backend", return_value=CliAgentRepairBackend()):
@@ -553,7 +565,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("Logs:", output)
 
     def test_series_command_translates_folder_with_shared_runtime_root(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             season = Path("season")
             season.mkdir()
             (season / "episode2.txt").write_text("hello Alice\n", encoding="utf-8")
@@ -581,7 +593,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("1 processed, 1 skipped, 0 failed", output)
 
     def test_agent_folder_reference_translates_series(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 "[defaults]\n"
                 'provider = "mock"\n'
@@ -599,7 +611,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("[MOCK-ZH] hello", (season / "episode1.translated.txt").read_text(encoding="utf-8"))
 
     def test_agent_edit_generated_subtitle_creates_backup(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 "[defaults]\n"
                 'provider = "mock"\n'
@@ -624,7 +636,7 @@ class CLITestCase(unittest.TestCase):
             self.assertEqual(len(backups), 1)
 
     def test_agent_file_operations_are_natural_language_tools(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 "[defaults]\n"
                 'provider = "mock"\n'
@@ -658,7 +670,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("updated line", backups[0].read_text(encoding="utf-8"))
 
     def test_agent_file_operations_refuse_paths_outside_project(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 "[defaults]\n"
                 'provider = "mock"\n'
@@ -680,7 +692,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("outside the project root", output)
 
     def test_agent_plan_mode_requires_approval_before_mutating(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 "[defaults]\n"
                 'provider = "mock"\n'
@@ -702,7 +714,7 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("Use /approve", output)
 
     def test_agent_reject_discards_pending_plan(self) -> None:
-        with self.runner.isolated_filesystem():
+        with self._isolated_filesystem():
             Path("subbake.toml").write_text(
                 "[defaults]\n"
                 'provider = "mock"\n'
