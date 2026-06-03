@@ -4,6 +4,8 @@ This file tracks notable changes for each release.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-03
+
 ### Added
 
 - `sbake` without a subcommand now opens a conversational agent interface while keeping `sbake translate` and other classic commands unchanged.
@@ -22,6 +24,11 @@ This file tracks notable changes for each release.
 - README and PyPI README now present the interactive agent as a primary workflow and keep detailed setup guidance in the project Wiki.
 - Agent inline pickers now use terminal-theme-friendly styling instead of a hard-coded dark background.
 - `pyproject.toml` now advertises `agent` as a package keyword.
+
+### Fixed
+
+- Command-line options such as `--target-language` now reliably override config profile values across Click/Typer versions.
+- `click` is now declared explicitly as a package dependency.
 
 ### Safety
 
