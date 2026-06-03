@@ -7,10 +7,24 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from prompt_toolkit.document import Document
+from rich.console import Console
 from typer.testing import CliRunner
 
 from subbake import __version__
+from subbake.agent import (
+    AGENT_COMMANDS,
+    CONFIG_BOOTSTRAP_CREATE,
+    NEW_PROFILE_VALUE,
+    SubBakeAgent,
+    _matching_picker_choices,
+    _picker_choices,
+    _resolve_picker_selection,
+    _slash_command_completer,
+    _unique_slash_command_match,
+)
 from subbake.app import app
+from subbake.config import load_app_config
 from subbake.entities import Usage
 from subbake.models.base_model import LLMBackend
 from subbake.storage import build_runtime_paths
@@ -61,6 +75,53 @@ class CLITestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = CliRunner()
 
+    def test_agent_slash_command_completer_filters_commands(self) -> None:
+        completer = _slash_command_completer()
+
+        all_commands = list(completer.get_completions(Document("/"), None))
+        model_commands = list(completer.get_completions(Document("/mo"), None))
+        no_commands = list(completer.get_completions(Document("hello /mo"), None))
+
+        self.assertEqual([completion.text for completion in all_commands], [command for command, _ in AGENT_COMMANDS])
+        self.assertEqual([completion.text for completion in model_commands], ["/model"])
+        self.assertEqual(no_commands, [])
+
+    def test_agent_tab_completion_resolves_unique_slash_command(self) -> None:
+        self.assertEqual(_unique_slash_command_match("/clea"), "/clear")
+        self.assertEqual(_unique_slash_command_match("/mo"), "/model")
+        self.assertIsNone(_unique_slash_command_match("/p"))
+
+    def test_agent_inline_picker_filters_by_label_and_metadata(self) -> None:
+        choices = _picker_choices(
+            [
+                ("alpha", "alpha: mock / mock-alpha"),
+                ("beta", "beta: openai / gpt-4o-mini"),
+                (NEW_PROFILE_VALUE, "new"),
+            ],
+            default="beta",
+        )
+
+        self.assertEqual([choice.value for choice in choices], ["beta", "alpha", NEW_PROFILE_VALUE])
+        self.assertEqual([choice.value for choice in _matching_picker_choices("", choices)], ["beta", "alpha", NEW_PROFILE_VALUE])
+        self.assertEqual([choice.value for choice in _matching_picker_choices("openai", choices)], ["beta"])
+        self.assertEqual([choice.value for choice in _matching_picker_choices("mock-alpha", choices)], ["alpha"])
+
+    def test_agent_inline_picker_resolves_visible_or_typed_selection(self) -> None:
+        choices = _picker_choices(
+            [
+                ("alpha", "alpha: mock / mock-alpha"),
+                ("beta", "beta: openai / gpt-4o-mini"),
+                (NEW_PROFILE_VALUE, "new"),
+            ],
+            default="beta",
+        )
+
+        self.assertEqual(_resolve_picker_selection("", choices, default="beta"), "beta")
+        self.assertEqual(_resolve_picker_selection("beta", choices, default="beta"), "beta")
+        self.assertEqual(_resolve_picker_selection("openai", choices, default="beta"), "beta")
+        self.assertEqual(_resolve_picker_selection("new", choices, default="beta"), NEW_PROFILE_VALUE)
+        self.assertIsNone(_resolve_picker_selection("a", choices, default="beta"))
+
     def test_root_help_mentions_main_commands(self) -> None:
         result = self.runner.invoke(app, ["--help"])
         output = self._strip_ansi(result.stdout)
@@ -109,6 +170,112 @@ class CLITestCase(unittest.TestCase):
             self.assertEqual(result.exit_code, 0)
             self.assertIn("Profile switched: beta", output)
             self.assertIn("mock / mock-beta", output)
+
+    def test_agent_model_command_lists_profiles_in_non_interactive_mode(self) -> None:
+        with self.runner.isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[profiles.alpha]\n"
+                'provider = "mock"\n'
+                'model = "mock-alpha"\n\n'
+                "[profiles.beta]\n"
+                'provider = "mock"\n'
+                'model = "mock-beta"\n',
+                encoding="utf-8",
+            )
+
+            result = self.runner.invoke(app, [], input="/model\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Profiles:", output)
+            self.assertIn("alpha: mock / mock-alpha", output)
+            self.assertIn("beta: mock / mock-beta", output)
+            self.assertIn("new: create a new model profile", output)
+
+    def test_agent_session_command_lists_session_titles(self) -> None:
+        with self.runner.isolated_filesystem():
+            result = self.runner.invoke(app, [], input="hello session\n/session\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Recent sessions:", output)
+            self.assertIn("hello session", output)
+
+    def test_agent_session_command_switches_by_id(self) -> None:
+        with self.runner.isolated_filesystem():
+            first = self.runner.invoke(app, [], input="first session\n/exit\n")
+            self.assertEqual(first.exit_code, 0)
+            session_files = sorted(Path(".subbake/agent/sessions").glob("*.json"))
+            self.assertEqual(len(session_files), 1)
+
+            result = self.runner.invoke(app, [], input=f"/session {session_files[0].stem}\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Session switched:", output)
+            self.assertIn("first session", output)
+
+    def test_agent_profile_new_is_interactive_only_from_scripted_input(self) -> None:
+        with self.runner.isolated_filesystem():
+            result = self.runner.invoke(app, [], input="/profile new\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Profile creation is available from the interactive /profile picker.", output)
+
+    def test_agent_offers_config_bootstrap_when_interactive_without_config(self) -> None:
+        with self.runner.isolated_filesystem():
+            with (
+                patch("subbake.agent.discover_config_path", return_value=None),
+                patch("subbake.agent.discover_project_config_path", return_value=None),
+            ):
+                agent = SubBakeAgent(console=Console(record=True), resume=False)
+
+            agent.interactive = True
+            with (
+                patch.object(agent, "_select_from_list", return_value=CONFIG_BOOTSTRAP_CREATE) as select,
+                patch.object(agent, "_create_profile_interactively") as create_profile,
+            ):
+                agent._maybe_offer_config_bootstrap()
+
+            select.assert_called_once()
+            create_profile.assert_called_once()
+
+    def test_agent_can_create_first_config_profile(self) -> None:
+        with self.runner.isolated_filesystem():
+            config_path = Path("xdg/subbake/config.toml")
+            with (
+                patch("subbake.agent.discover_config_path", return_value=None),
+                patch("subbake.agent.discover_project_config_path", return_value=None),
+                patch("subbake.agent.global_config_candidates", return_value=[config_path]),
+            ):
+                agent = SubBakeAgent(console=Console(record=True), resume=False)
+                agent.interactive = True
+                answers = iter(["chatgpt", "openai", "gpt-4o-mini", "OPENAI_API_KEY", "", "Chinese"])
+                with patch.object(agent, "_prompt_text", side_effect=lambda *args, **kwargs: next(answers)):
+                    agent._create_profile_interactively()
+
+            config = load_app_config(config_path)
+            self.assertEqual(agent.profile, "chatgpt")
+            self.assertEqual(agent.session.config_path, str(config_path))
+            self.assertEqual(config.profiles["chatgpt"]["provider"], "openai")
+            self.assertEqual(config.profiles["chatgpt"]["model"], "gpt-4o-mini")
+            self.assertEqual(config.profiles["chatgpt"]["api_key_env"], "OPENAI_API_KEY")
+
+    def test_agent_created_profile_uses_current_config_when_present(self) -> None:
+        with self.runner.isolated_filesystem():
+            config_path = Path("subbake.toml")
+            config_path.write_text("[defaults]\nprovider = \"mock\"\n", encoding="utf-8")
+            agent = SubBakeAgent(console=Console(record=True), resume=False)
+            agent.interactive = True
+            answers = iter(["local", "mock", "mock-zh", "", "", "Chinese"])
+            with patch.object(agent, "_prompt_text", side_effect=lambda *args, **kwargs: next(answers)):
+                agent._create_profile_interactively()
+
+            config = load_app_config(config_path)
+            self.assertEqual(agent.profile, "local")
+            self.assertEqual(agent.session.config_path, str(config_path.resolve()))
+            self.assertEqual(config.profiles["local"]["provider"], "mock")
 
     def test_resume_command_starts_agent_when_no_session_exists(self) -> None:
         with self.runner.isolated_filesystem():
@@ -368,7 +535,7 @@ class CLITestCase(unittest.TestCase):
             season.mkdir()
             (season / "episode1.txt").write_text("hello\n", encoding="utf-8")
 
-            result = self.runner.invoke(app, [], input="@season\n/exit\n")
+            result = self.runner.invoke(app, [], input="翻译 @season\n/exit\n")
 
             self.assertEqual(result.exit_code, 0)
             self.assertIn("[MOCK-ZH] hello", (season / "episode1.translated.txt").read_text(encoding="utf-8"))
@@ -388,7 +555,7 @@ class CLITestCase(unittest.TestCase):
             result = self.runner.invoke(
                 app,
                 [],
-                input="/edit @clip.translated.txt keep the translation unchanged\n/exit\n",
+                input="请修改 @clip.translated.txt keep the translation unchanged\n/exit\n",
             )
             output = self._strip_ansi(result.stdout)
 
@@ -397,6 +564,104 @@ class CLITestCase(unittest.TestCase):
             self.assertEqual(Path("clip.translated.txt").read_text(encoding="utf-8"), "[MOCK-ZH] hello\n")
             backups = list(Path(".subbake/agent/backups").glob("*/clip.translated.txt"))
             self.assertEqual(len(backups), 1)
+
+    def test_agent_file_operations_are_natural_language_tools(self) -> None:
+        with self.runner.isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            result = self.runner.invoke(
+                app,
+                [],
+                input=(
+                    "创建 @notes.txt first line\n"
+                    "追加 @notes.txt second line\n"
+                    "替换 @notes.txt second line => updated line\n"
+                    "把 @notes.txt 改名为 @renamed.txt\n"
+                    "删除 @renamed.txt\n"
+                    "/exit\n"
+                ),
+            )
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertFalse(Path("renamed.txt").exists())
+            self.assertIn("Created:", output)
+            self.assertIn("Appended:", output)
+            self.assertIn("Modified:", output)
+            self.assertIn("Renamed:", output)
+            self.assertIn("Deleted:", output)
+            backups = list(Path(".subbake/agent/backups").glob("**/renamed.txt"))
+            self.assertEqual(len(backups), 1)
+            self.assertIn("updated line", backups[0].read_text(encoding="utf-8"))
+
+    def test_agent_file_operations_refuse_paths_outside_project(self) -> None:
+        with self.runner.isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            outside = Path.cwd().parent / "outside-agent-test.txt"
+
+            result = self.runner.invoke(
+                app,
+                [],
+                input=f"创建 @{outside} nope\n/exit\n",
+            )
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertFalse(outside.exists())
+            self.assertIn("outside the project root", output)
+
+    def test_agent_plan_mode_requires_approval_before_mutating(self) -> None:
+        with self.runner.isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            result = self.runner.invoke(
+                app,
+                [],
+                input="/plan\n创建 @notes.txt first line\n/approve\n/exit\n",
+            )
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertTrue(Path("notes.txt").exists())
+            self.assertEqual(Path("notes.txt").read_text(encoding="utf-8"), "first line")
+            self.assertIn("<proposed_plan>", output)
+            self.assertIn("Use /approve", output)
+
+    def test_agent_reject_discards_pending_plan(self) -> None:
+        with self.runner.isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            result = self.runner.invoke(
+                app,
+                [],
+                input="/plan\n创建 @notes.txt first line\n/reject\n/exit\n",
+            )
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertFalse(Path("notes.txt").exists())
+            self.assertIn("Pending plan discarded", output)
 
     def _strip_ansi(self, value: str) -> str:
         return re.sub(r"\x1b\[[0-9;]*m", "", value)

@@ -4,6 +4,28 @@ This file tracks notable changes for each release.
 
 ## [Unreleased]
 
+### Added
+
+- `sbake` without a subcommand now opens a conversational agent interface while keeping `sbake translate` and other classic commands unchanged.
+- The agent can decide from natural language whether to translate `@file`, translate an `@folder` as a series, diagnose SubBake failure logs, edit generated translated subtitles, or perform simple project-local text file work such as create, append, replace text, rename, and delete.
+- Agent sessions are persisted locally under `.subbake/agent/sessions/*.json`, with `/session` and `sbake resume` support for returning to previous conversations.
+- Slash command completion is available in the agent: type `/`, keep typing to filter, use `Tab` for unique completions, and use Up/Down plus Enter to choose from command or picker menus.
+- `/model`, `/profile`, and `/session` now open compact inline pickers in interactive terminals instead of full-screen dialogs; profile pickers include a `new` option for creating a profile.
+- When the interactive agent starts without any config file, it offers to create the first model profile automatically instead of requiring manual `subbake.toml` setup.
+- Plan mode is available for mutating agent actions through `Shift+Tab` or `/plan`, with `/approve` and `/reject` for proposed tool calls.
+- Series translation can process a subtitle folder with shared glossary and translation memory context across the run.
+
+### Changed
+
+- README and PyPI README now present the interactive agent as a primary workflow and keep detailed setup guidance in the project Wiki.
+- Agent inline pickers now use terminal-theme-friendly styling instead of a hard-coded dark background.
+- `pyproject.toml` now advertises `agent` as a package keyword.
+
+### Safety
+
+- Agent file operations are internal tools rather than slash commands; users describe intent naturally and the agent selects the tool.
+- Project-local file mutations are guarded, block protected paths such as `.git`, `.venv`, and `.subbake`, and create backups for destructive edits.
+
 ## [0.3.2] - 2026-05-18
 
 ### Added
