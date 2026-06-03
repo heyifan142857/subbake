@@ -17,10 +17,13 @@ from subbake.agent import (
     CONFIG_BOOTSTRAP_CREATE,
     NEW_PROFILE_VALUE,
     SubBakeAgent,
+    _default_api_key_env,
     _matching_picker_choices,
     _picker_choices,
     _resolve_picker_selection,
+    _resolve_text_prompt_value,
     _slash_command_completer,
+    _text_prompt_matches,
     _unique_slash_command_match,
 )
 from subbake.app import app
@@ -121,6 +124,23 @@ class CLITestCase(unittest.TestCase):
         self.assertEqual(_resolve_picker_selection("openai", choices, default="beta"), "beta")
         self.assertEqual(_resolve_picker_selection("new", choices, default="beta"), NEW_PROFILE_VALUE)
         self.assertIsNone(_resolve_picker_selection("a", choices, default="beta"))
+
+    def test_agent_inline_text_prompt_helpers(self) -> None:
+        self.assertEqual(_resolve_text_prompt_value("", default="Chinese"), "Chinese")
+        self.assertEqual(_resolve_text_prompt_value("ja", default="Chinese"), "ja")
+        self.assertEqual(
+            _text_prompt_matches("op", ("mock", "openai", "anthropic", "gemini", "openai-compatible")),
+            ["openai", "openai-compatible"],
+        )
+        self.assertEqual(_text_prompt_matches("", ("zh", "en")), ["zh", "en"])
+
+    def test_agent_new_profile_default_api_key_env_depends_on_provider(self) -> None:
+        self.assertEqual(_default_api_key_env("openai"), "OPENAI_API_KEY")
+        self.assertEqual(_default_api_key_env("openai-compatible"), "OPENAI_API_KEY")
+        self.assertEqual(_default_api_key_env("compatible"), "OPENAI_API_KEY")
+        self.assertEqual(_default_api_key_env("anthropic"), "ANTHROPIC_API_KEY")
+        self.assertEqual(_default_api_key_env("gemini"), "GEMINI_API_KEY")
+        self.assertEqual(_default_api_key_env("mock"), "")
 
     def test_root_help_mentions_main_commands(self) -> None:
         result = self.runner.invoke(app, ["--help"])
@@ -258,6 +278,7 @@ class CLITestCase(unittest.TestCase):
             config = load_app_config(config_path)
             self.assertEqual(agent.profile, "chatgpt")
             self.assertEqual(agent.session.config_path, str(config_path))
+            self.assertEqual(config.default_profile, "chatgpt")
             self.assertEqual(config.profiles["chatgpt"]["provider"], "openai")
             self.assertEqual(config.profiles["chatgpt"]["model"], "gpt-4o-mini")
             self.assertEqual(config.profiles["chatgpt"]["api_key_env"], "OPENAI_API_KEY")
@@ -275,7 +296,44 @@ class CLITestCase(unittest.TestCase):
             config = load_app_config(config_path)
             self.assertEqual(agent.profile, "local")
             self.assertEqual(agent.session.config_path, str(config_path.resolve()))
+            self.assertEqual(config.default_profile, "local")
             self.assertEqual(config.profiles["local"]["provider"], "mock")
+
+    def test_agent_created_profile_does_not_replace_existing_default(self) -> None:
+        with self.runner.isolated_filesystem():
+            config_path = Path("subbake.toml")
+            config_path.write_text(
+                'default_profile = "alpha"\n\n'
+                "[profiles.alpha]\n"
+                'provider = "mock"\n'
+                'model = "mock-alpha"\n',
+                encoding="utf-8",
+            )
+            agent = SubBakeAgent(console=Console(record=True), resume=False)
+            agent.interactive = True
+            answers = iter(["beta", "mock", "mock-beta", "", "", "Chinese"])
+            with patch.object(agent, "_prompt_text", side_effect=lambda *args, **kwargs: next(answers)):
+                agent._create_profile_interactively()
+
+            config = load_app_config(config_path)
+            self.assertEqual(config.default_profile, "alpha")
+            self.assertIn("beta", config.profiles)
+
+    def test_agent_new_profile_cancellation_does_not_write_config(self) -> None:
+        with self.runner.isolated_filesystem():
+            config_path = Path("xdg/subbake/config.toml")
+            with (
+                patch("subbake.agent.discover_config_path", return_value=None),
+                patch("subbake.agent.discover_project_config_path", return_value=None),
+                patch("subbake.agent.global_config_candidates", return_value=[config_path]),
+            ):
+                agent = SubBakeAgent(console=Console(record=True), resume=False)
+                agent.interactive = True
+                with patch.object(agent, "_prompt_text", return_value=None):
+                    agent._create_profile_interactively()
+
+            self.assertFalse(config_path.exists())
+            self.assertIsNone(agent.profile)
 
     def test_resume_command_starts_agent_when_no_session_exists(self) -> None:
         with self.runner.isolated_filesystem():

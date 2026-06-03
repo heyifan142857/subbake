@@ -53,6 +53,9 @@ NEW_PROFILE_VALUE = "__subbake_new_profile__"
 CONFIG_BOOTSTRAP_CREATE = "create"
 CONFIG_BOOTSTRAP_SKIP = "skip"
 PICKER_CANCEL_TOKEN = "__subbake_picker_cancelled__"
+PROFILE_PROVIDER_OPTIONS = ("mock", "openai", "anthropic", "gemini", "openai-compatible")
+PROFILE_TARGET_LANGUAGE_OPTIONS = ("Chinese", "zh", "en", "ja", "ko", "fr", "es", "de")
+PROFILE_API_KEY_ENV_OPTIONS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY")
 
 
 @dataclass(slots=True)
@@ -764,31 +767,62 @@ class SubBakeAgent:
             self.console.print("Profile creation is available from the interactive /profile picker.")
             return
         config_path = self._config_path_for_profile_write()
-        profile_name = (self._prompt_text("New profile", "Profile name", default="") or "").strip()
-        if not profile_name:
-            self.console.print("[bold yellow]Profile creation cancelled.[/bold yellow]")
+        profile_name_prompt = self._prompt_text("New profile", "Profile name", default="")
+        if profile_name_prompt is None or not profile_name_prompt.strip():
+            self._cancel_profile_creation()
             return
+        profile_name = profile_name_prompt.strip()
         if self.config is not None and profile_name in self.config.profiles:
             raise ValueError(f"Config profile '{profile_name}' already exists.")
 
-        provider = (
-            self._prompt_text("New profile", "Provider", default=str(self.values.get("provider") or "mock"))
-            or "mock"
-        ).strip()
-        model = (
-            self._prompt_text("New profile", "Model", default=str(self.values.get("model") or "mock-zh"))
-            or "mock-zh"
-        ).strip()
-        api_key_env = (self._prompt_text("New profile", "API key environment variable", default="") or "").strip()
-        base_url = (self._prompt_text("New profile", "Base URL", default="") or "").strip()
-        target_language = (
-            self._prompt_text(
-                "New profile",
-                "Target language",
-                default=str(self.values.get("target_language") or "Chinese"),
-            )
-            or "Chinese"
-        ).strip()
+        provider_default = str(self.values.get("provider") or "mock")
+        provider_prompt = self._prompt_text(
+            "New profile",
+            "Provider",
+            default=provider_default,
+            completions=PROFILE_PROVIDER_OPTIONS,
+        )
+        if provider_prompt is None:
+            self._cancel_profile_creation()
+            return
+        provider = provider_prompt.strip() or provider_default
+
+        model_default = str(self.values.get("model") or "mock-zh")
+        model_prompt = self._prompt_text("New profile", "Model", default=model_default)
+        if model_prompt is None:
+            self._cancel_profile_creation()
+            return
+        model = model_prompt.strip() or model_default
+
+        api_key_env_default = _default_api_key_env(provider)
+        api_key_env_prompt = self._prompt_text(
+            "New profile",
+            "API key environment variable",
+            default=api_key_env_default,
+            completions=PROFILE_API_KEY_ENV_OPTIONS,
+        )
+        if api_key_env_prompt is None:
+            self._cancel_profile_creation()
+            return
+        api_key_env = api_key_env_prompt.strip()
+
+        base_url_prompt = self._prompt_text("New profile", "Base URL", default="")
+        if base_url_prompt is None:
+            self._cancel_profile_creation()
+            return
+        base_url = base_url_prompt.strip()
+
+        target_language_default = str(self.values.get("target_language") or "Chinese")
+        target_language_prompt = self._prompt_text(
+            "New profile",
+            "Target language",
+            default=target_language_default,
+            completions=PROFILE_TARGET_LANGUAGE_OPTIONS,
+        )
+        if target_language_prompt is None:
+            self._cancel_profile_creation()
+            return
+        target_language = target_language_prompt.strip() or target_language_default
 
         profile_values = {
             "provider": provider,
@@ -803,6 +837,9 @@ class SubBakeAgent:
         self.session.config_path = str(config_path)
         self._switch_profile(profile_name)
         self.console.print(f"[bold green]Profile created:[/bold green] {profile_name} in {config_path}")
+
+    def _cancel_profile_creation(self) -> None:
+        self.console.print("[bold yellow]Profile creation cancelled.[/bold yellow]")
 
     def _maybe_offer_config_bootstrap(self) -> None:
         if not self.interactive or self.config is not None:
@@ -836,10 +873,14 @@ class SubBakeAgent:
             existing_config = load_app_config(path)
             if profile_name in existing_config.profiles:
                 raise ValueError(f"Config profile '{profile_name}' already exists.")
+            should_set_default = existing_config.default_profile is None and not existing_config.profiles
             content = path.read_text(encoding="utf-8")
         else:
+            should_set_default = True
             content = ""
         prefix = content
+        if should_set_default:
+            prefix = _prepend_default_profile(prefix, profile_name)
         if prefix and not prefix.endswith("\n"):
             prefix += "\n"
         if prefix and not prefix.endswith("\n\n"):
@@ -1151,9 +1192,18 @@ class SubBakeAgent:
                 return str(selected)
         return self._choose(title, options, default=default)
 
-    def _prompt_text(self, title: str, text: str, *, default: str) -> str | None:
+    def _prompt_text(
+        self,
+        title: str,
+        text: str,
+        *,
+        default: str,
+        completions: tuple[str, ...] = (),
+    ) -> str | None:
         if self.interactive:
-            answer = _prompt_toolkit_input_dialog(title, text, default=default)
+            answer = _prompt_toolkit_inline_text(title, text, default=default, completions=completions)
+            if answer == PICKER_CANCEL_TOKEN:
+                return None
             if answer is not None:
                 return str(answer)
         if not self.interactive:
@@ -1424,12 +1474,138 @@ def _picker_toolbar(title: str) -> str:
     return f" {title}: type to filter, Tab/Enter to select, Esc to cancel "
 
 
-def _prompt_toolkit_input_dialog(title: str, text: str, *, default: str) -> str | None:
+def _prompt_toolkit_inline_text(
+    title: str,
+    text: str,
+    *,
+    default: str,
+    completions: tuple[str, ...],
+) -> str | None:
     try:
-        from prompt_toolkit.shortcuts import input_dialog
+        from prompt_toolkit import prompt
+        from prompt_toolkit.completion import Completer, Completion
+        from prompt_toolkit.filters import has_completions
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.shortcuts import CompleteStyle
+        from prompt_toolkit.styles import Style
     except Exception:
         return None
-    return input_dialog(title=title, text=text, default=default).run()
+
+    class InlineTextCompleter(Completer):
+        def get_completions(self, document, complete_event):
+            query = document.text_before_cursor.strip()
+            for value in _text_prompt_matches(query, completions):
+                yield Completion(
+                    value,
+                    start_position=-len(document.text_before_cursor),
+                )
+
+    key_bindings = KeyBindings()
+
+    @key_bindings.add("down", filter=has_completions)
+    def _next_completion(event) -> None:
+        event.current_buffer.complete_next()
+
+    @key_bindings.add("up", filter=has_completions)
+    def _previous_completion(event) -> None:
+        event.current_buffer.complete_previous()
+
+    @key_bindings.add("tab")
+    def _complete(event) -> None:
+        buffer = event.current_buffer
+        query = buffer.document.text_before_cursor
+        matches = _text_prompt_matches(query, completions)
+        if len(matches) == 1:
+            buffer.delete_before_cursor(len(query))
+            buffer.insert_text(matches[0])
+            return
+        completion = _current_completion(buffer)
+        if completion is not None:
+            buffer.apply_completion(completion)
+            return
+        buffer.start_completion(select_first=True)
+
+    @key_bindings.add("enter")
+    def _accept(event) -> None:
+        buffer = event.current_buffer
+        completion = _current_completion(buffer)
+        if completion is not None:
+            buffer.apply_completion(completion)
+        event.app.exit(result=buffer.text)
+
+    @key_bindings.add("escape")
+    @key_bindings.add("c-c")
+    def _cancel(event) -> None:
+        event.app.exit(result=PICKER_CANCEL_TOKEN)
+
+    style = Style.from_dict(
+        {
+            "completion-menu.completion": "",
+            "completion-menu.completion.current": "reverse bold",
+            "bottom-toolbar": "reverse",
+        }
+    )
+
+    try:
+        raw_value = prompt(
+            _text_prompt(text),
+            completer=InlineTextCompleter() if completions else None,
+            complete_while_typing=True,
+            complete_style=CompleteStyle.COLUMN,
+            key_bindings=key_bindings,
+            reserve_space_for_menu=6,
+            bottom_toolbar=_text_prompt_toolbar(title, text, default),
+            style=style,
+        )
+    except KeyboardInterrupt:
+        return PICKER_CANCEL_TOKEN
+    if raw_value == PICKER_CANCEL_TOKEN:
+        return PICKER_CANCEL_TOKEN
+    return _resolve_text_prompt_value(raw_value, default=default)
+
+
+def _text_prompt_matches(query: str, completions: tuple[str, ...]) -> list[str]:
+    normalized = query.strip().casefold()
+    if not completions:
+        return []
+    if not normalized:
+        return list(completions)
+    return [value for value in completions if value.casefold().startswith(normalized)]
+
+
+def _resolve_text_prompt_value(raw_value: str, *, default: str) -> str:
+    if raw_value == "":
+        return default
+    return raw_value
+
+
+def _default_api_key_env(provider: str) -> str:
+    normalized = provider.strip().casefold()
+    if normalized in {"openai", "openai-compatible", "compatible"}:
+        return "OPENAI_API_KEY"
+    if normalized == "anthropic":
+        return "ANTHROPIC_API_KEY"
+    if normalized == "gemini":
+        return "GEMINI_API_KEY"
+    return ""
+
+
+def _text_prompt(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text.strip().casefold())
+    labels = {
+        "profile name": "profile name",
+        "provider": "provider",
+        "model": "model",
+        "api key environment variable": "api key env",
+        "base url": "base url",
+        "target language": "target language",
+    }
+    return f"{labels.get(normalized, normalized or 'value')}> "
+
+
+def _text_prompt_toolbar(title: str, text: str, default: str) -> str:
+    default_text = f", default: {default}" if default else ""
+    return f" {title} / {text}{default_text}: Enter accepts, Tab completes, Esc cancels "
 
 
 def _toml_key(value: str) -> str:
@@ -1440,6 +1616,13 @@ def _toml_key(value: str) -> str:
 
 def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def _prepend_default_profile(content: str, profile_name: str) -> str:
+    default_line = f"default_profile = {_toml_string(profile_name)}\n"
+    if not content:
+        return default_line
+    return f"{default_line}\n{content}"
 
 
 def _short_title(value: str, *, limit: int = 72) -> str:

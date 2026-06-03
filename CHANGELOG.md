@@ -11,6 +11,8 @@ This file tracks notable changes for each release.
 - Agent sessions are persisted locally under `.subbake/agent/sessions/*.json`, with `/session` and `sbake resume` support for returning to previous conversations.
 - Slash command completion is available in the agent: type `/`, keep typing to filter, use `Tab` for unique completions, and use Up/Down plus Enter to choose from command or picker menus.
 - `/model`, `/profile`, and `/session` now open compact inline pickers in interactive terminals instead of full-screen dialogs; profile pickers include a `new` option for creating a profile.
+- New profile creation now uses a compact inline wizard with provider, API-key environment, and target-language completion instead of full-screen input dialogs.
+- The profile creation wizard now writes `default_profile` when it creates the first profile in a config file.
 - When the interactive agent starts without any config file, it offers to create the first model profile automatically instead of requiring manual `subbake.toml` setup.
 - Plan mode is available for mutating agent actions through `Shift+Tab` or `/plan`, with `/approve` and `/reject` for proposed tool calls.
 - Series translation can process a subtitle folder with shared glossary and translation memory context across the run.

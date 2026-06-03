@@ -16,7 +16,7 @@ sbake
 ```
 
 Inside the agent, you can point at files or folders, switch model profiles, resume sessions, inspect SubBake failure logs, make constrained edits to generated translated subtitles, and perform simple project-local file operations.
-Typing `/` opens the command picker; keep typing to filter, then use `Tab` to complete or Up/Down and Enter to choose. `Shift+Tab` toggles plan mode, where mutating actions are proposed for approval before execution. `/session`, `/model`, and `/profile` open compact inline pickers for previous sessions and model profiles, with `new` available when creating a profile interactively.
+Typing `/` opens the command picker; keep typing to filter, then use `Tab` to complete or Up/Down and Enter to choose. `Shift+Tab` toggles plan mode, where mutating actions are proposed for approval before execution. `/session`, `/model`, and `/profile` open compact inline pickers for previous sessions and model profiles, with an inline `new` profile wizard available when creating a profile interactively.
 If no config file is found, the interactive agent can create the first model profile for you.
 
 ```text
