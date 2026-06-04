@@ -12,3 +12,4 @@ uv.lock
 *.bilingual.txt
 build/
 dist/
+CLAUDE.md

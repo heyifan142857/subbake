@@ -142,6 +142,8 @@ class MockBackend(LLMBackend):
         elif task == "agent_loop_decide":
             context = json.loads(_extract_between(prompt, "AGENT_LOOP_CONTEXT_JSON_START", "AGENT_LOOP_CONTEXT_JSON_END"))
             result = _mock_agent_loop_decision(context)
+        elif task == "intent_classify":
+            result = _mock_intent_classify(prompt)
         else:
             raise ValueError(f"Unsupported mock task: {task}")
 
@@ -1098,7 +1100,28 @@ def _format_backend_error_message(metadata: BackendErrorMetadata) -> str:
         parts.append("retryable=yes")
     else:
         parts.append("retryable=no")
-    body = (metadata.response_body or "").strip().replace("\n", " ")
-    if body:
-        parts.append(f"body={body[:400]}")
-    return "; ".join(parts)
+def _mock_intent_classify(prompt: str) -> dict[str, Any]:
+    """Classify intent based on keyword matching for mock backend."""
+    lowered = prompt.casefold()
+
+    has_refs = bool(re.search(r'"exists"\s*:\s*true', prompt))
+    has_dir = bool(re.search(r'"is_dir"\s*:\s*true', prompt))
+
+    if has_dir and any(w in lowered for w in ("翻译", "translate", "series")):
+        return {"category": "translate_series", "parameters": {}, "confidence": 0.85, "reason": "Directory reference found"}
+    if has_refs and any(w in lowered for w in ("诊断", "分析", "diagnose", "error", "log", "failure")):
+        return {"category": "diagnose", "parameters": {}, "confidence": 0.85, "reason": "Diagnosis keywords matched"}
+    if has_refs and any(w in lowered for w in ("编辑", "修改", "edit", "fix", "change")):
+        return {"category": "edit_subtitle", "parameters": {}, "confidence": 0.85, "reason": "Edit keywords matched"}
+    if has_refs and any(w in lowered for w in ("翻译", "translate", "双语", "中英", "bilingual")):
+        return {"category": "translate_file", "parameters": {}, "confidence": 0.85, "reason": "Translation keywords matched"}
+    if any(w in lowered for w in ("翻译", "translate", "双语", "中英", "bilingual")):
+        return {"category": "translate_file", "parameters": {}, "confidence": 0.75, "reason": "Translation keywords matched (no ref)"}
+    if any(w in lowered for w in ("搜索", "查找", "search", "find", "list", "show", "列", "查看", "当前目录")):
+        return {"category": "browse", "parameters": {}, "confidence": 0.85, "reason": "Browse/list keywords matched"}
+    if any(w in lowered for w in ("profile", "model", "模型", "配置")):
+        return {"category": "profile", "parameters": {}, "confidence": 0.85, "reason": "Profile keywords matched"}
+    if any(w in lowered for w in ("创建", "create", "删除", "delete", "改名", "rename", "追加", "append", "替换", "replace")):
+        return {"category": "file_operation", "parameters": {}, "confidence": 0.8, "reason": "File operation keywords matched"}
+
+    return {"category": "chat", "parameters": {}, "confidence": 0.5, "reason": "No clear intent detected"}

@@ -70,12 +70,22 @@ class AgentObservation:
     arguments: dict[str, Any]
     preview: str
     data: dict[str, Any] = field(default_factory=dict)
+    context_summary: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "tool_name": self.tool_name,
             "arguments": self.arguments,
             "preview": self.preview,
+            "data": self.data,
+        }
+
+    def to_context_dict(self) -> dict[str, Any]:
+        summary = self.context_summary or self.preview
+        return {
+            "tool_name": self.tool_name,
+            "arguments": self.arguments,
+            "summary": summary,
             "data": self.data,
         }
 
@@ -88,17 +98,22 @@ class AgentLoopState:
     allowed_tools: tuple[str, ...] = field(default_factory=tuple)
     steps: list[AgentLoopStep] = field(default_factory=list)
     observations: list[AgentObservation] = field(default_factory=list)
+    pre_populated_arguments: dict[str, Any] = field(default_factory=dict)
 
     def to_context(self) -> dict[str, Any]:
-        return {
+        base = {
             "original_user_message": self.original_user_message,
             "max_steps": self.max_steps,
             "current_mode": self.current_mode,
             "allowed_tools": list(self.allowed_tools),
             "steps": [step.to_dict() for step in self.steps],
-            "observations": [observation.to_dict() for observation in self.observations],
             "remaining_steps": max(self.max_steps - len(self.steps), 0),
         }
+        if self.observations:
+            base["observations"] = [o.to_context_dict() for o in self.observations]
+        if self.pre_populated_arguments:
+            base["pre_populated_arguments"] = self.pre_populated_arguments
+        return base
 
 
 @dataclass(frozen=True, slots=True)

@@ -40,6 +40,8 @@ from subbake.diagnostics import diagnose_path, diagnose_text, format_diagnostic_
 from subbake.editing import edit_generated_subtitle, is_generated_subtitle
 from subbake.file_ops import FileOpResult, FileOperationGuard
 from subbake.pipeline import SubtitlePipeline
+from subbake.models import build_backend
+from subbake.models.base_model import MockBackend
 from subbake.runtime_options import (
     build_backend_from_values,
     build_pipeline_options,
@@ -51,6 +53,25 @@ from subbake.ui import Dashboard
 
 SESSION_VERSION = 1
 AGENT_LOOP_MAX_STEPS = 5
+
+CONFIDENCE_LOW_THRESHOLD = 0.4
+CONFIDENCE_MEDIUM_THRESHOLD = 0.7
+CONFIDENCE_MIN_OBSERVATIONS = 2
+
+TOOL_CATEGORIES: dict[str, list[str]] = {
+    "translate_file": ["translate_file"],
+    "translate_series": ["translate_series"],
+    "edit_subtitle": ["edit_subtitle"],
+    "diagnose": ["diagnose_path", "diagnose_text"],
+    "file_operation": ["create_file", "append_file", "replace_in_file", "rename_path", "delete_file", "read_file"],
+    "browse": ["list_files", "search_files", "read_file", "read_file_preview", "candidate_subtitles"],
+    "profile": ["switch_profile", "list_profiles"],
+    "chat": [],
+}
+ALWAYS_AVAILABLE_TOOLS: tuple[str, ...] = (
+    "list_files", "search_files", "read_file_preview", "recent_translations", "candidate_subtitles",
+)
+
 REFERENCE_RE = re.compile(r"@(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
 AGENT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show agent help"),
@@ -267,7 +288,13 @@ class SubBakeAgent:
 
     def _handle_conversational_line(self, line: str) -> None:
         self._record_event("user", line)
-        decision = self._deterministic_decision_from_line(line) or self._run_agent_loop(line)
+        decision = self._deterministic_decision_from_line(line)
+        if decision is None:
+            intent = self._classify_intent(line)
+            if intent is not None:
+                decision = self._intent_to_decision(intent, line)
+            else:
+                decision = self._run_agent_loop(line)
         self._handle_decision(decision, original=line)
 
     def _deterministic_decision_from_line(self, line: str) -> dict[str, Any] | None:
@@ -588,13 +615,210 @@ class SubBakeAgent:
             return None
         return files[0] if files else None
 
-    def _run_agent_loop(self, line: str) -> dict[str, Any]:
+    VALID_INTENT_CATEGORIES = frozenset({
+        "translate_file", "translate_series", "edit_subtitle",
+        "diagnose", "file_operation", "browse", "profile", "chat",
+    })
+
+    def _classify_intent(self, line: str) -> dict[str, Any] | None:
+        """Lightweight intent classification. Returns intent dict or None to skip gate."""
+        backend = build_backend_from_values(self.values)
+        if backend is None:
+            return self._fallback_intent_classification(line)
+        if isinstance(backend, MockBackend):
+            return self._mock_classify_intent(line)
+
+        context = {
+            "message": line,
+            "cwd": str(self.cwd),
+            "profile": self.profile,
+            "recent_events": self.session.events[-4:],
+        }
+        system_prompt = (
+            "You are a classifier for a subtitle translation agent. "
+            "Classify the user's request into exactly one category and extract parameters.\n"
+            "Categories:\n"
+            "- translate_file: Translate a single subtitle file\n"
+            "- translate_series: Translate a series/folder of subtitle files\n"
+            "- edit_subtitle: Edit/post-process an already-generated subtitle\n"
+            "- diagnose: Analyze failure logs or subtitle files\n"
+            "- file_operation: Create, append, replace, rename, or delete files\n"
+            "- browse: List, search, or read files\n"
+            "- profile: Switch or list model profiles\n"
+            "- chat: General conversation, no tool needed\n\n"
+            "Return JSON only with: category, confidence (0-1), parameters (dict), and reason.\n"
+            "Extract file paths, language names, format preferences from natural language."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+        ]
+        try:
+            payload, _ = backend.generate_json(messages)
+        except Exception:
+            return None
+
+        if not isinstance(payload, dict) or "category" not in payload:
+            return None
+        category = str(payload.get("category", ""))
+        if category not in self.VALID_INTENT_CATEGORIES:
+            return None
+        return {
+            "category": category,
+            "parameters": dict(payload.get("parameters", {})),
+            "confidence": float(payload.get("confidence", 0.5)),
+            "reason": str(payload.get("reason", "")),
+        }
+
+    def _mock_classify_intent(self, line: str) -> dict[str, Any] | None:
+        """Keyword-based intent classification for mock backend.
+        Only returns classification when confident enough to skip the agent loop.
+        Returns None for ambiguous cases, letting existing agent loop handle them."""
+
+        lowered = line.casefold()
+        references = self._extract_references(line)
+        has_refs = bool(references)
+        has_dir = any(r.is_dir() for r in references)
+        has_file = any(r.is_file() for r in references)
+
+        first_ref = str(references[0]) if references else ""
+
+        # Clear translation with directory reference → skip agent loop
+        if has_dir and any(w in lowered for w in ("翻译", "translate", "series")):
+            return {"category": "translate_series", "parameters": {"path": first_ref}, "confidence": 0.9, "reason": "Directory reference"}
+        # Edit with reference — must come before translate check to avoid
+        # matching "translate" inside "translated" in file paths
+        if has_refs and any(w in lowered for w in ("编辑", "修改", "edit", "fix", "change")):
+            return {"category": "edit_subtitle", "parameters": {"path": first_ref}, "confidence": 0.9, "reason": "Edit reference"}  # fmt: skip
+        # Clear translation with file reference → skip agent loop
+        if has_file and any(
+            lowered.startswith(w) or f" {w}" in lowered
+            for w in ("翻译", "translate")
+        ):
+            return {"category": "translate_file", "parameters": {"path": first_ref}, "confidence": 0.9, "reason": "File reference"}
+        # Explicit diagnose with reference → skip agent loop
+        if has_refs and any(w in lowered for w in ("诊断", "分析", "diagnose", "error", "log", "failure")):
+            return {"category": "diagnose", "parameters": {"path": first_ref}, "confidence": 0.9, "reason": "Diagnosis reference"}  # fmt: skip
+        # Everything else → let agent loop handle
+        return None
+
+    def _fallback_intent_classification(self, line: str) -> dict[str, Any] | None:
+        """Fallback when no backend is available. Only fires for clear cases with references."""
+        lowered = line.casefold()
+        references = self._extract_references(line)
+        has_refs = bool(references)
+        if has_refs and any(w in lowered for w in ("翻译", "translate")):
+            paths = [str(r) for r in references]
+            if len(references) == 1 and references[0].is_dir():
+                return {"category": "translate_series", "parameters": {"path": paths[0]}, "confidence": 0.5, "reason": "Fallback: translate dir"}  # fmt: skip
+            return {"category": "translate_file", "parameters": {"path": paths[0]}, "confidence": 0.5, "reason": "Fallback: translate ref"}  # fmt: skip
+        return None
+
+    def _intent_to_decision(self, intent: dict[str, Any], line: str) -> dict[str, Any]:
+        """Convert intent classification to an agent decision."""
+        category = intent["category"]
+        params = intent["parameters"]
+        reason = intent.get("reason", "")
+
+        if category == "chat":
+            return {"action": "respond", "message": "How can I help with your subtitles?"}
+
+        allowed_tools: set[str] = set(ALWAYS_AVAILABLE_TOOLS)
+        allowed_tools.update(TOOL_CATEGORIES.get(category, []))
+
+        intent_confidence = intent.get("confidence", 0.5)
+        if intent_confidence < 0.4:
+            return {"action": "ask_user", "message": f"I'm not sure what you want to do. Could you clarify?\n\n({reason})"}
+
+        pre_args = self._prepopulate_args_from_intent_parameters(params)
+
+        if intent_confidence >= 0.85 and self._has_required_args(category, pre_args):
+            return {
+                "action": "final_tool_call",
+                "tool_name": self._category_to_default_tool(category),
+                "arguments": pre_args,
+                "message": reason or f"Proceeding with {category}.",
+                "confidence": intent_confidence,
+                "reason": reason,
+            }
+
         state = AgentLoopState(
             original_user_message=line,
             max_steps=AGENT_LOOP_MAX_STEPS,
             current_mode=self.session.mode,
-            allowed_tools=tuple(tool["name"] for tool in self._tool_specs()),
+            allowed_tools=tuple(sorted(allowed_tools)),
+            pre_populated_arguments=pre_args,
         )
+        return self._run_agent_loop(line, state=state)
+
+    def _prepopulate_args_from_intent_parameters(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        """Convert intent-extracted parameters into tool argument format."""
+        args: dict[str, Any] = {}
+        for key in ("path", "target_language", "source_language", "output_format", "pattern", "query", "content", "old", "new", "old_path", "new_path", "instruction", "text"):
+            if key in parameters:
+                args[key] = parameters[key]
+        for key in ("bilingual", "recursive", "overwrite", "dry_run", "fast", "final_review"):
+            if key in parameters:
+                args[key] = bool(parameters[key])
+        return args
+
+    def _has_required_args(self, category: str, args: dict[str, Any]) -> bool:
+        if category in {"translate_file", "diagnose"}:
+            return "path" in args
+        if category == "edit_subtitle":
+            return "path" in args and "instruction" in args
+        if category == "translate_series":
+            return "path" in args
+        return False
+
+    def _category_to_default_tool(self, category: str) -> str:
+        mapping = {
+            "translate_file": "translate_file",
+            "translate_series": "translate_series",
+            "edit_subtitle": "edit_subtitle",
+            "diagnose": "diagnose_path",
+            "file_operation": "create_file",
+            "browse": "list_files",
+            "profile": "list_profiles",
+        }
+        return mapping.get(category, "list_files")
+
+    def _apply_confidence_gate(
+        self,
+        decision: dict[str, Any],
+        state: AgentLoopState,
+    ) -> dict[str, Any] | None:
+        """Check LLM confidence and gate mutating actions. Returns a modified decision or None to proceed.
+        Only gates final_tool_call (mutating) — discovery tool_call actions pass through unchanged."""
+        action = str(decision.get("action") or "").strip()
+        if action not in {"final_tool_call"}:
+            return None
+
+        raw_confidence = decision.get("confidence")
+        if not isinstance(raw_confidence, (int, float)):
+            return None
+
+        confidence = float(raw_confidence)
+        reason = str(decision.get("reason") or "")
+        num_observations = len(state.observations)
+
+        if confidence < CONFIDENCE_LOW_THRESHOLD:
+            return {"action": "respond", "message": "I need more information to proceed confidently. Could you please clarify your request?"}
+
+        if confidence < CONFIDENCE_MEDIUM_THRESHOLD and num_observations < CONFIDENCE_MIN_OBSERVATIONS:
+            message = reason or f"I think I should {action} but I am not entirely sure."
+            return {"action": "ask_user", "message": f"{message}\n\nCan you confirm this is what you want?"}
+
+        return None
+
+    def _run_agent_loop(self, line: str, *, state: AgentLoopState | None = None) -> dict[str, Any]:
+        if state is None:
+            state = AgentLoopState(
+                original_user_message=line,
+                max_steps=AGENT_LOOP_MAX_STEPS,
+                current_mode=self.session.mode,
+                allowed_tools=tuple(tool["name"] for tool in self._tool_specs()),
+            )
         trace = _AgentLoopTrace(console=self.console, interactive=self.interactive)
         trace.start()
         for _ in range(state.max_steps):
@@ -602,6 +826,12 @@ class SubBakeAgent:
                 decision = self._decide_loop_next_action(state, show_status=False)
             state.steps.append(self._loop_step_from_decision(decision))
             action = str(decision.get("action") or "").strip()
+
+            gated = self._apply_confidence_gate(decision, state)
+            if gated is not None:
+                state.steps.append(self._loop_step_from_decision(gated))
+                trace.final(gated)
+                return gated
 
             if action == "tool_call":
                 tool_name = str(decision.get("tool_name") or "").strip()
@@ -657,6 +887,12 @@ class SubBakeAgent:
         return payload
 
     def _build_agent_loop_decision_messages(self, state: AgentLoopState) -> list[dict[str, str]]:
+        all_tools = self._tool_specs()
+        if state.allowed_tools:
+            allowed_set = set(state.allowed_tools)
+            filtered_tools = [t for t in all_tools if t["name"] in allowed_set]
+        else:
+            filtered_tools = all_tools
         context = {
             **state.to_context(),
             "user_message": state.original_user_message,
@@ -666,7 +902,7 @@ class SubBakeAgent:
             "project_root": str(self.project_root),
             "references": self._reference_context(state.original_user_message),
             "recent_events": self.session.events[-8:],
-            "tools": self._tool_specs(),
+            "tools": filtered_tools,
         }
         system_prompt = (
             "You are SubBake's bounded local project agent.\n"
@@ -759,6 +995,42 @@ class SubBakeAgent:
             )
         return enriched
 
+    def _summarize_observation(self, observation: AgentObservation) -> str:
+        """Compress an observation into a concise summary string for LLM context."""
+        if observation.tool_name == "list_files":
+            files = observation.data.get("files", [])
+            kinds: dict[str, int] = {}
+            for f in files:
+                k = str(f.get("kind", "file"))
+                kinds[k] = kinds.get(k, 0) + 1
+            parts = [f"{v} {k} file(s)" for k, v in sorted(kinds.items())]
+            return f"{len(files)} items: {', '.join(parts)}"
+        if observation.tool_name == "search_files":
+            candidates = observation.data.get("candidates", [])
+            if candidates:
+                top = candidates[:3]
+                top_paths = [str(c.get("path", "")) for c in top]
+                return f"{len(candidates)} candidate(s), top: {', '.join(top_paths)}"
+            matches = observation.data.get("matches", [])
+            return f"{len(matches)} match(es)" if matches else "no matches"
+        if observation.tool_name == "candidate_subtitles":
+            candidates = observation.data.get("candidates", [])
+            if not candidates:
+                return "no subtitle candidates"
+            top = [str(c.get("path", "")) for c in candidates[:3]]
+            return f"{len(candidates)} candidate(s): {', '.join(top)}"
+        if observation.tool_name == "recent_translations":
+            records = observation.data.get("translations", [])
+            if not records:
+                return "no recent translations"
+            first = records[0]
+            return f"{len(records)} recent: {str(first.get('tool_name', ''))} {str(first.get('path', ''))}"
+        if observation.tool_name == "read_file_preview":
+            path = str(observation.data.get("path", ""))
+            text = str(observation.data.get("text", ""))
+            return f"preview {path} ({len(text)} chars)"
+        return observation.preview
+
     def _run_discovery_tool_call(
         self,
         tool_name: str,
@@ -781,12 +1053,14 @@ class SubBakeAgent:
                 }
                 for item in files
             ]
-            return AgentObservation(
+            obs = AgentObservation(
                 tool_name=tool_name,
                 arguments={"path": str(path), "recursive": recursive},
                 preview=f"{len(items)} files",
                 data={"files": items},
             )
+            obs.context_summary = self._summarize_observation(obs)
+            return obs
 
         if tool_name == "search_files":
             path = self._resolve_user_path(str(arguments.get("path") or "."))
@@ -794,12 +1068,14 @@ class SubBakeAgent:
             if not pattern:
                 pattern = self._search_pattern_from_text(original)
             if not pattern:
-                return AgentObservation(
+                obs = AgentObservation(
                     tool_name=tool_name,
                     arguments={"path": str(path), "pattern": pattern},
                     preview="no search pattern",
                     data={"pattern": pattern, "candidates": [], "matches": []},
                 )
+                obs.context_summary = self._summarize_observation(obs)
+                return obs
             candidates = self._rank_candidates_in_path(path, pattern, limit=20)
             data: dict[str, Any] = {"pattern": pattern, "candidates": [candidate.to_dict() for candidate in candidates]}
             if not candidates:
@@ -808,23 +1084,27 @@ class SubBakeAgent:
                 preview = f"{len(matches)} text matches" if matches else "no matches"
             else:
                 preview = self._candidate_observation_preview(candidates)
-            return AgentObservation(
+            obs = AgentObservation(
                 tool_name=tool_name,
                 arguments={"path": str(path), "pattern": pattern},
                 preview=preview,
                 data=data,
             )
+            obs.context_summary = self._summarize_observation(obs)
+            return obs
 
         if tool_name == "candidate_subtitles":
             path = self._resolve_user_path(str(arguments.get("path") or "."))
             query = str(arguments.get("query") or "").strip() or original
             candidates = self._rank_candidates_in_path(path, query, limit=20)
-            return AgentObservation(
+            obs = AgentObservation(
                 tool_name=tool_name,
                 arguments={"path": str(path), "query": query},
                 preview=self._candidate_observation_preview(candidates),
                 data={"query": query, "candidates": [candidate.to_dict() for candidate in candidates]},
             )
+            obs.context_summary = self._summarize_observation(obs)
+            return obs
 
         if tool_name == "recent_translations":
             records = self._recent_translation_records()
@@ -833,23 +1113,27 @@ class SubBakeAgent:
                 if records
                 else "no recent translations"
             )
-            return AgentObservation(
+            obs = AgentObservation(
                 tool_name=tool_name,
                 arguments={},
                 preview=preview,
                 data={"translations": records},
             )
+            obs.context_summary = self._summarize_observation(obs)
+            return obs
 
         if tool_name == "read_file_preview":
             path = self._resolve_user_path(str(arguments.get("path") or ""))
             limit = int(arguments.get("limit") or 2000)
             text = FileOperationGuard(project_root=self.project_root).read_file(path, limit=limit)
-            return AgentObservation(
+            obs = AgentObservation(
                 tool_name=tool_name,
                 arguments={"path": str(path), "limit": limit},
                 preview=f"preview {path.relative_to(self.project_root)} ({len(text)} chars)",
                 data={"path": str(path.relative_to(self.project_root)), "text": text},
             )
+            obs.context_summary = self._summarize_observation(obs)
+            return obs
 
         raise ValueError(f"Unsupported discovery tool: {tool_name}")
 
@@ -1259,56 +1543,251 @@ class SubBakeAgent:
             )
         return references
 
-    def _tool_specs(self) -> list[dict[str, Any]]:
-        return [
+    def _tool_specs(self, categories: list[str] | None = None) -> list[dict[str, Any]]:
+        all_tools = [
             {
                 "name": "translate_file",
                 "mutating": True,
-                "args": [
-                    "path",
-                    "bilingual",
-                    "target_language",
-                    "source_language",
-                    "output_format",
-                    "dry_run",
-                    "fast",
-                    "final_review",
-                ],
+                "category": "translate_file",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the subtitle file to translate."},
+                        "bilingual": {"type": "boolean", "description": "Output bilingual subtitles (source + translation)."},
+                        "target_language": {"type": "string", "description": "Target language for the translation."},
+                        "source_language": {"type": "string", "description": "Source language; auto-detect if omitted."},
+                        "output_format": {"type": "string", "description": "Output format: srt, vtt, or txt.", "enum": ["srt", "vtt", "txt"]},
+                        "dry_run": {"type": "boolean", "description": "Only plan batches without calling the model."},
+                        "fast": {"type": "boolean", "description": "Skip quality review for speed."},
+                        "final_review": {"type": "boolean", "description": "Enable final consistency review."},
+                    },
+                    "required": ["path"],
+                },
             },
             {
                 "name": "translate_series",
                 "mutating": True,
-                "args": [
-                    "path",
-                    "recursive",
-                    "overwrite",
-                    "dry_run",
-                    "suffixes",
-                    "bilingual",
-                    "target_language",
-                    "source_language",
-                    "output_format",
-                    "fast",
-                    "final_review",
-                ],
+                "category": "translate_series",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the folder containing subtitle files."},
+                        "recursive": {"type": "boolean", "description": "Search subdirectories for subtitle files."},
+                        "overwrite": {"type": "boolean", "description": "Overwrite existing translated output files."},
+                        "dry_run": {"type": "boolean", "description": "Only plan batches without calling the model."},
+                        "suffixes": {"type": "array", "items": {"type": "string"}, "description": "File extensions to include, e.g. .srt .vtt .txt."},
+                        "bilingual": {"type": "boolean", "description": "Output bilingual subtitles."},
+                        "target_language": {"type": "string", "description": "Target language."},
+                        "source_language": {"type": "string", "description": "Source language."},
+                        "output_format": {"type": "string", "description": "Output format: srt, vtt, or txt.", "enum": ["srt", "vtt", "txt"]},
+                        "fast": {"type": "boolean", "description": "Skip quality review for speed."},
+                        "final_review": {"type": "boolean", "description": "Enable final consistency review."},
+                    },
+                    "required": ["path"],
+                },
             },
-            {"name": "edit_subtitle", "mutating": True, "args": ["path", "instruction"]},
-            {"name": "diagnose_path", "mutating": False, "args": ["path"]},
-            {"name": "diagnose_text", "mutating": False, "args": ["text"]},
-            {"name": "read_file", "mutating": False, "args": ["path"]},
-            {"name": "list_files", "mutating": False, "args": ["path", "recursive"]},
-            {"name": "search_files", "mutating": False, "args": ["path", "pattern"]},
-            {"name": "recent_translations", "mutating": False, "args": []},
-            {"name": "candidate_subtitles", "mutating": False, "args": ["path", "query"]},
-            {"name": "read_file_preview", "mutating": False, "args": ["path", "limit"]},
-            {"name": "create_file", "mutating": True, "args": ["path", "content"]},
-            {"name": "append_file", "mutating": True, "args": ["path", "content"]},
-            {"name": "replace_in_file", "mutating": True, "args": ["path", "old", "new"]},
-            {"name": "rename_path", "mutating": True, "args": ["old_path", "new_path"]},
-            {"name": "delete_file", "mutating": True, "args": ["path"]},
-            {"name": "list_profiles", "mutating": False, "args": []},
-            {"name": "switch_profile", "mutating": False, "args": ["profile"]},
+            {
+                "name": "edit_subtitle",
+                "mutating": True,
+                "category": "edit_subtitle",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the generated subtitle file to edit."},
+                        "instruction": {"type": "string", "description": "Edit instruction describing the changes to make."},
+                    },
+                    "required": ["path", "instruction"],
+                },
+            },
+            {
+                "name": "diagnose_path",
+                "mutating": False,
+                "category": "diagnose",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the failure log or subtitle file to diagnose."},
+                    },
+                    "required": ["path"],
+                },
+            },
+            {
+                "name": "diagnose_text",
+                "mutating": False,
+                "category": "diagnose",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "Error text or log content to analyze."},
+                    },
+                    "required": ["text"],
+                },
+            },
+            {
+                "name": "read_file",
+                "mutating": False,
+                "category": "file_operation",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file to read."},
+                    },
+                    "required": ["path"],
+                },
+            },
+            {
+                "name": "list_files",
+                "mutating": False,
+                "category": "browse",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Directory to list."},
+                        "recursive": {"type": "boolean", "description": "List files in subdirectories."},
+                    },
+                },
+            },
+            {
+                "name": "search_files",
+                "mutating": False,
+                "category": "browse",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Directory to search."},
+                        "pattern": {"type": "string", "description": "Search term or pattern."},
+                    },
+                    "required": ["pattern"],
+                },
+            },
+            {
+                "name": "recent_translations",
+                "mutating": False,
+                "category": "browse",
+                "schema": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+            {
+                "name": "candidate_subtitles",
+                "mutating": False,
+                "category": "browse",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Directory to search for subtitle files."},
+                        "query": {"type": "string", "description": "Search query to match subtitle titles."},
+                    },
+                },
+            },
+            {
+                "name": "read_file_preview",
+                "mutating": False,
+                "category": "browse",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file to preview."},
+                        "limit": {"type": "integer", "description": "Maximum number of characters to read."},
+                    },
+                    "required": ["path"],
+                },
+            },
+            {
+                "name": "create_file",
+                "mutating": True,
+                "category": "file_operation",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path for the new file."},
+                        "content": {"type": "string", "description": "Initial file content."},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+            {
+                "name": "append_file",
+                "mutating": True,
+                "category": "file_operation",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file to append to."},
+                        "content": {"type": "string", "description": "Content to append."},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+            {
+                "name": "replace_in_file",
+                "mutating": True,
+                "category": "file_operation",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file to modify."},
+                        "old": {"type": "string", "description": "Text to replace."},
+                        "new": {"type": "string", "description": "Replacement text."},
+                    },
+                    "required": ["path", "old", "new"],
+                },
+            },
+            {
+                "name": "rename_path",
+                "mutating": True,
+                "category": "file_operation",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "old_path": {"type": "string", "description": "Current file path."},
+                        "new_path": {"type": "string", "description": "New file path."},
+                    },
+                    "required": ["old_path", "new_path"],
+                },
+            },
+            {
+                "name": "delete_file",
+                "mutating": True,
+                "category": "file_operation",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file to delete."},
+                    },
+                    "required": ["path"],
+                },
+            },
+            {
+                "name": "list_profiles",
+                "mutating": False,
+                "category": "profile",
+                "schema": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+            {
+                "name": "switch_profile",
+                "mutating": False,
+                "category": "profile",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "profile": {"type": "string", "description": "Name of the profile to switch to."},
+                    },
+                    "required": ["profile"],
+                },
+            },
         ]
+        if categories is not None:
+            allowed: set[str] = set()
+            for cat in categories:
+                allowed.update(TOOL_CATEGORIES.get(cat, []))
+            allowed.update(ALWAYS_AVAILABLE_TOOLS)
+            return [t for t in all_tools if t["name"] in allowed]
+        return all_tools
 
     def _resolve_user_path(self, value: str) -> Path:
         if not value:

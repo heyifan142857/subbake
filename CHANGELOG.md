@@ -4,6 +4,25 @@ This file tracks notable changes for each release.
 
 ## [Unreleased]
 
+### Added
+
+- Agent now pre-classifies user intents before entering the full agent loop. High-confidence intents (translation, series, editing, diagnosis, file operations, browsing, profile switching) can go directly to tool execution, and the agent loop only loads tools relevant to the detected category, improving both speed and focus.
+- A mock intent classifier for the mock backend supports keyword-based classification, enabling offline testing of the intent gate.
+- An intent-confidence gating system routes low-confidence requests to clarification prompts and medium-confidence requests to user confirmation, preventing premature or incorrect tool calls.
+- Agent observations now carry a `context_summary` field, with per-tool-type summarization (`list_files` counts by kind, `search_files` shows top candidates, `candidate_subtitles` lists matches, `recent_translations` reports the latest record, `read_file_preview` includes char count).
+- The agent loop context includes `pre_populated_arguments` from intent parameters and uses compact `to_context_dict()` representations with summaries instead of full observation dumps.
+- Tool specifications migrated from flat arg lists to structured JSON schemas with categorized tool groups, enabling intent-based filtering of available tools in the agent loop.
+- Tests for the intent classification gate (`test_intent_gate.py`) covering mock classification across all categories, fallback classification, confidence gating at different thresholds, and required-arg validation.
+- Tests for observation summarization (`test_observation_summary.py`) covering `list_files`, `search_files`, `candidate_subtitles`, `recent_translations`, and `read_file_preview` summaries.
+
+### Changed
+
+- `.gitignore` now excludes `CLAUDE.md` from version control.
+
+### Fixed
+
+- The original `_run_agent_loop` signature is preserved with an optional `state` parameter, keeping backward compatibility for existing callers.
+
 ## [0.4.1] - 2026-06-03
 
 ### Added
