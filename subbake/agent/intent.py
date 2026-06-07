@@ -150,7 +150,7 @@ def intent_to_decision(
     reason = intent.get("reason", "")
 
     if category == "chat":
-        return {"action": "respond", "message": "How can I help with your subtitles?"}
+        return {"action": "respond", "message": "Hello! I'm SubBake, your subtitle translation assistant. How can I help you today?"}
 
     allowed_tools: set[str] = set(ALWAYS_AVAILABLE_TOOLS)
     allowed_tools.update(TOOL_CATEGORIES.get(category, []))

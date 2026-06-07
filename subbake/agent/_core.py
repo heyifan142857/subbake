@@ -136,6 +136,7 @@ from subbake.file_ops import FileOpResult, FileOperationGuard
 # build_backend_from_values is accessed via _runtime_options module reference
 # so that tests can patch the source module.
 from subbake import runtime_options as _runtime_options
+from subbake.models.base_model import MockBackend
 from subbake.title_matching import title_tokens_from_text
 
 AGENT_LOOP_MAX_STEPS = 5
@@ -248,10 +249,69 @@ class SubBakeAgent:
         if decision is None:
             intent = _classify_intent(self, line)
             if intent is not None:
-                decision = _intent_to_decision(self, intent, line, run_agent_loop=self._run_agent_loop, agent_loop_max_steps=AGENT_LOOP_MAX_STEPS)
+                if intent.get("category") == "chat":
+                    self._handle_chat(line)
+                    return
+                decision = _intent_to_decision(
+                    self, intent, line,
+                    run_agent_loop=self._run_agent_loop,
+                    agent_loop_max_steps=AGENT_LOOP_MAX_STEPS,
+                )
             else:
                 decision = self._run_agent_loop(line)
         self._handle_decision(decision, original=line)
+
+    def _handle_chat(self, line: str) -> None:
+        """Handle casual chat / non-tool user input with an LLM response."""
+        backend = _runtime_options.build_backend_from_values(self.values)
+        if backend is None or isinstance(backend, MockBackend):
+            fallback = "How can I help with your subtitles?"
+            self.console.print(fallback)
+            self._record_event("assistant", fallback, {"decision": "respond"})
+            return
+
+        messages = self._build_chat_messages(line)
+        try:
+            payload, _ = backend.generate_json(messages)
+            response = str(payload.get("message", "") or "").strip()
+            if not response:
+                response = "How can I help with your subtitles?"
+        except Exception:
+            response = "How can I help with your subtitles?"
+
+        if response:
+            self.console.print(response)
+            self._record_event("assistant", response, {"decision": "respond"})
+
+    def _build_chat_messages(self, line: str) -> list[dict[str, str]]:
+        """Build a chat message list with conversation history for casual chat."""
+        system_prompt = (
+            "你是 SubBake，一个友好的字幕翻译助手。你可以帮助用户翻译字幕文件（.srt、.vtt、.txt），"
+            "也可以闲聊。请用用户使用的语言自然、简洁地回复。\n"
+            "返回 JSON 格式：{\"message\": \"你的回复\"}\n"
+            "You are SubBake, a friendly subtitle translation assistant. You help users translate "
+            "subtitle files (.srt, .vtt, .txt) using AI models. You can also chat casually.\n"
+            "Respond in the user's language naturally and concisely.\n"
+            "Return JSON: {\"message\": \"your response\"}"
+        )
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+        ]
+
+        # Pull conversation history from session events (user + assistant pairs only)
+        relevant = [
+            e for e in self.session.events
+            if e.get("kind") in ("user", "assistant")
+        ]
+        for event in relevant[-16:]:
+            kind = event.get("kind", "")
+            text = event.get("input", "")
+            if kind == "user":
+                messages.append({"role": "user", "content": text})
+            elif kind == "assistant":
+                messages.append({"role": "assistant", "content": text})
+
+        return messages
 
 
 
@@ -345,7 +405,7 @@ class SubBakeAgent:
             "cwd": str(self.cwd),
             "project_root": str(self.project_root),
             "references": self._reference_context(state.original_user_message),
-            "recent_events": self.session.events[-8:],
+            "recent_events": self.session.events[-20:],
             "tools": filtered_tools,
         }
         system_prompt = (

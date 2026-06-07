@@ -15,13 +15,6 @@ The main entrypoint is the interactive agent — reference files with `@` and us
 sbake
 ```
 
-```
-翻译 @episode01.srt         translate a subtitle file
-翻译 @Season01              translate a folder as a series
-/model chatgpt              switch model profiles
-/session                    switch between agent sessions
-```
-
 No config file? The agent creates your first profile on startup.
 
 For detailed setup and examples, use the [project Wiki](https://github.com/heyifan142857/SubBake/wiki).
