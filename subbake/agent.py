@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sys
 import uuid
 from collections.abc import Iterator
@@ -84,6 +85,7 @@ AGENT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/plan off", "turn plan mode off"),
     ("/approve", "execute the pending plan"),
     ("/reject", "discard the pending plan"),
+    ("/undo", "undo the last file operation"),
     ("/resume", "resume the latest session"),
     ("/exit", "quit"),
     ("/quit", "quit"),
@@ -277,6 +279,9 @@ class SubBakeAgent:
             return True
         if command == "/reject":
             self._reject_pending_plan()
+            return True
+        if command == "/undo":
+            self._undo_last_operation()
             return True
         if command is not None:
             self.console.print("Unknown command. Use /help for available agent controls.")
@@ -1471,6 +1476,78 @@ class SubBakeAgent:
                 "backup_path": str(result.backup_path),
             },
         )
+
+    def _undo_last_operation(self) -> None:
+        """Undo the most recent file operation by restoring from its backup."""
+        # Find the most recent file_operation event that wasn't already undone
+        undo_target: dict[str, Any] | None = None
+        for event in reversed(self.session.events):
+            if event.get("kind") != "file_operation":
+                continue
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+            if data.get("undone"):
+                continue
+            undo_target = data
+            break
+
+        if undo_target is None:
+            self.console.print("[bold yellow]Nothing to undo.[/bold yellow]")
+            self._record_event("undo", "/undo", {"result": "nothing_to_undo"})
+            return
+
+        action = str(undo_target.get("action") or "")
+        path = Path(str(undo_target.get("path") or ""))
+        new_path_str = str(undo_target.get("new_path") or "")
+        backup_str = str(undo_target.get("backup_path") or "")
+
+        if action == "created":
+            if path.exists():
+                path.unlink()
+                self.console.print(f"[bold green]Undo created:[/bold green] deleted {path}")
+            else:
+                self.console.print(f"[bold yellow]Created file no longer exists:[/bold yellow] {path}")
+
+        elif action in {"appended", "modified", "renamed"}:
+            backup = Path(backup_str) if backup_str else None
+            if backup is None or not backup.exists():
+                self.console.print(
+                    f"[bold yellow]Backup not found for {action}:[/bold yellow] {path}. Cannot undo."
+                )
+                self._record_event("undo", "/undo", {"result": "backup_missing", "path": str(path)})
+                return
+            if action == "renamed":
+                new_path = Path(new_path_str) if new_path_str else None
+                if new_path is not None and new_path.exists():
+                    new_path.unlink()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(backup, path)
+                self.console.print(f"[bold green]Undo renamed:[/bold green] restored {path}")
+            else:
+                shutil.copy2(backup, path)
+                self.console.print(f"[bold green]Undo {action}:[/bold green] restored {path}")
+
+        elif action == "deleted":
+            backup = Path(backup_str) if backup_str else None
+            if backup is None or not backup.exists():
+                self.console.print(
+                    f"[bold yellow]Backup not found for deleted file:[/bold yellow] {path}. Cannot undo."
+                )
+                self._record_event("undo", "/undo", {"result": "backup_missing", "path": str(path)})
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup, path)
+            self.console.print(f"[bold green]Undo deleted:[/bold green] restored {path}")
+
+        else:
+            self.console.print(f"[bold yellow]Unknown operation type:[/bold yellow] {action}")
+            self._record_event("undo", "/undo", {"result": "unknown_action", "action": action})
+            return
+
+        # Mark the operation as undone so repeated /undo skips it
+        undo_target["undone"] = True
+        self._record_event("undo", "/undo", {"result": "ok", "action": action, "path": str(path)})
 
     def _record_file_op_event(self, result: FileOpResult, original: str) -> None:
         self._record_event(

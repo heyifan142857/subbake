@@ -115,9 +115,10 @@ class FileOperationGuard:
             raise FileNotFoundError(f"Path not found: {safe_old_path}")
         if safe_new_path.exists():
             raise ValueError(f"Destination already exists: {safe_new_path}")
+        backup_path = self._backup_path(safe_old_path)
         safe_new_path.parent.mkdir(parents=True, exist_ok=True)
         safe_old_path.rename(safe_new_path)
-        return FileOpResult(action="renamed", path=safe_old_path, new_path=safe_new_path)
+        return FileOpResult(action="renamed", path=safe_old_path, new_path=safe_new_path, backup_path=backup_path)
 
     def delete_file(self, path: Path) -> FileOpResult:
         safe_path = self._resolve_safe_path(path)
