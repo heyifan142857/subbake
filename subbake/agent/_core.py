@@ -790,6 +790,24 @@ class SubBakeAgent:
             }
         )
 
+    def _build_input_history(self):
+        """Build InMemoryHistory from session events for up/down arrow navigation."""
+        try:
+            from prompt_toolkit.history import InMemoryHistory
+        except Exception:
+            return None
+        history = InMemoryHistory()
+        count = 0
+        for event in self.session.events:
+            if count >= 100:
+                break
+            if event.get('kind') == 'user':
+                text = event.get('input', '')
+                if text and text.strip():
+                    history.append_string(text)
+                    count += 1
+        return history
+
     def _read_line(self) -> str:
         mode = "|plan" if self.session.mode == "plan" else ""
         prompt = f"sbake[{self.profile or 'default'}{mode}]> "
@@ -799,6 +817,7 @@ class SubBakeAgent:
                 prompt,
                 completer=_slash_command_completer(),
                 key_bindings=_build_plan_toggle_key_bindings(self),
+                history=self._build_input_history(),
             )
         return self.console.input(prompt, markup=False)
 

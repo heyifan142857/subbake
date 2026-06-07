@@ -166,12 +166,13 @@ def _prompt_toolkit_prompt():
     except Exception:
         return None
 
-    def _run(prompt_text: str, *, completer=None, key_bindings=None) -> str:
+    def _run(prompt_text: str, *, completer=None, key_bindings=None, history=None) -> str:
         return prompt(
             prompt_text,
             completer=completer,
             complete_while_typing=True,
             key_bindings=key_bindings,
+            history=history,
         )
 
     return _run
