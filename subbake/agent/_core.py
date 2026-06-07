@@ -491,6 +491,7 @@ class SubBakeAgent:
                 path=source_path,
                 arguments=enriched,
                 series=False,
+                user_message=original,
             )
         if tool_name == "translate_series" and enriched.get("path"):
             requested_path = self._resolve_user_path(str(enriched["path"]))
@@ -500,6 +501,7 @@ class SubBakeAgent:
                 path=requested_path,
                 arguments=enriched,
                 series=True,
+                user_message=original,
             )
         return enriched
 

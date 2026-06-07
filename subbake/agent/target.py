@@ -28,12 +28,41 @@ def source_path_for_translation_reference(path: Path) -> Path | None:
     return None
 
 
+def infer_target_from_user_language(text: str) -> str | None:
+    """Infer the target translation language from the user's natural language query.
+
+    When the user doesn't explicitly specify a target language, detect the
+    language they are writing in and use it as the translation target.
+
+    Detection priority: Japanese kana > Korean hangul > Chinese CJK > Latin.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None
+    # Japanese (Hiragana + Katakana) — checked first because Japanese text also
+    # uses CJK ideographs shared with Chinese
+    if re.search(r"[぀-ゟ]", stripped) or re.search(r"[゠-ヿ]", stripped):
+        return "Japanese"
+    # Korean (Hangul Syllables) — checked before CJK because Korean text also
+    # uses hanja (CJK ideographs)
+    if re.search(r"[가-힯]", stripped):
+        return "Korean"
+    # Chinese characters (CJK Unified Ideographs)
+    if re.search(r"[一-鿿]", stripped):
+        return "Chinese"
+    # Latin script → default to English
+    if re.search(r"[a-zA-Z]", stripped):
+        return "English"
+    return None
+
+
 def translation_arguments_for_target(
     agent: SubBakeAgent,
     *,
     path: Path,
     arguments: dict[str, Any],
     series: bool,
+    user_message: str = "",
 ) -> dict[str, Any]:
     """Enrich translation arguments with inferred target language."""
     enriched = dict(arguments)
@@ -47,6 +76,12 @@ def translation_arguments_for_target(
         )
         if target_language is not None:
             enriched["target_language"] = target_language
+
+        # If still no target language, infer from the user's query language
+        if "target_language" not in enriched:
+            inferred = infer_target_from_user_language(user_message)
+            if inferred is not None:
+                enriched["target_language"] = inferred
     return enriched
 
 
