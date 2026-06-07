@@ -63,7 +63,7 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
     "translate_series": ["translate_series"],
     "edit_subtitle": ["edit_subtitle"],
     "diagnose": ["diagnose_path", "diagnose_text"],
-    "file_operation": ["create_file", "append_file", "replace_in_file", "rename_path", "delete_file", "read_file"],
+    "file_operation": ["create_file", "append_file", "replace_in_file", "rename_path", "delete_file"],
     "browse": ["list_files", "search_files", "read_file", "read_file_preview", "candidate_subtitles"],
     "profile": ["switch_profile", "list_profiles"],
     "chat": [],
@@ -1234,55 +1234,6 @@ class SubBakeAgent:
                 break
         return records
 
-    def _decide_next_action(self, line: str) -> dict[str, Any]:
-        backend = build_backend_from_values(self.values)
-        if backend is None:
-            raise RuntimeError("Agent conversation requires a model backend.")
-        messages = self._build_agent_decision_messages(line)
-        with self.console.status("Model thinking...", spinner="dots"):
-            payload, _ = backend.generate_json(messages)
-        if not isinstance(payload, dict):
-            raise ValueError("Agent decision must be a JSON object.")
-        action = str(payload.get("action") or "").strip()
-        if action not in {"respond", "tool_call", "final_tool_call", "plan", "ask_user"}:
-            raise ValueError(f"Unsupported agent decision action: {action or '<missing>'}")
-        return payload
-
-    def _build_agent_decision_messages(self, line: str) -> list[dict[str, str]]:
-        context = {
-            "user_message": line,
-            "mode": self.session.mode,
-            "profile": self.profile,
-            "cwd": str(self.cwd),
-            "project_root": str(self.project_root),
-            "references": self._reference_context(line),
-            "recent_events": self.session.events[-8:],
-            "tools": self._tool_specs(),
-        }
-        system_prompt = (
-            "You are SubBake's conversational subtitle agent.\n"
-            "Return valid JSON only.\n"
-            "Choose one action: respond, ask_user, plan, or tool_call.\n"
-            "Use tools for concrete work. Do not invent file contents or command results.\n"
-            "When mode is plan, never return tool_call; return plan with tool_calls instead.\n"
-            "Low-level file operations are internal tools, not user slash commands.\n"
-            "If a requested mutation is ambiguous, return ask_user or plan instead of tool_call.\n"
-        )
-        user_prompt = (
-            "TASK_START\n"
-            "agent_decide\n"
-            "TASK_END\n"
-            'Return JSON with action plus "message". For tool_call include "tool_name" and "arguments". '
-            'For plan include "tool_calls".\n'
-            "AGENT_CONTEXT_JSON_START\n"
-            f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}\n"
-            "AGENT_CONTEXT_JSON_END\n"
-        )
-        return [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
     def _handle_decision(self, decision: dict[str, Any], *, original: str) -> None:
         action = decision["action"]
         if action == "final_tool_call":
@@ -1633,7 +1584,7 @@ class SubBakeAgent:
             {
                 "name": "read_file",
                 "mutating": False,
-                "category": "file_operation",
+                "category": "browse",
                 "schema": {
                     "type": "object",
                     "properties": {
@@ -2031,9 +1982,70 @@ class SubBakeAgent:
         self.session.pending_plan = plan
         self.console.print("<proposed_plan>")
         self.console.print(plan["message"])
+        if tool_calls:
+            self.console.print("─" * 40)
+            for call in tool_calls:
+                self._print_tool_call_preview(call)
+            self.console.print("─" * 40)
         self.console.print("</proposed_plan>")
         self.console.print("Use /approve to execute this plan, or /reject to discard it.")
         self._record_event("plan", original, {"tool_calls": tool_calls})
+
+    def _print_tool_call_preview(self, call: dict[str, Any]) -> None:
+        tool_name = str(call.get("tool_name") or "unknown")
+        arguments = dict(call.get("arguments") or {})
+
+        self.console.print(f"[bold]{tool_name}[/bold]")
+
+        path = str(arguments.get("path") or arguments.get("old_path") or "")
+        if path:
+            self.console.print(f"  path: {path}")
+        new_path = str(arguments.get("new_path") or "")
+        if new_path:
+            self.console.print(f"  → {new_path}")
+
+        if tool_name in {"create_file", "append_file"}:
+            self._print_content_preview(str(arguments.get("content") or ""))
+        elif tool_name == "replace_in_file":
+            self._print_replace_preview(
+                str(arguments.get("old") or ""),
+                str(arguments.get("new") or ""),
+            )
+        elif tool_name == "edit_subtitle":
+            instruction = str(arguments.get("instruction") or "")
+            if instruction:
+                self.console.print(f"  instruction: {instruction}")
+        elif tool_name == "translate_file":
+            self._print_translation_options(arguments)
+        elif tool_name == "translate_series":
+            self._print_translation_options(arguments)
+
+    def _print_content_preview(self, content: str) -> None:
+        if not content:
+            self.console.print("  [dim](empty content)[/dim]")
+            return
+        preview = content if len(content) <= 300 else f"{content[:300]}..."
+        self.console.print(f"  content ({len(content)} chars):")
+        for line in preview.splitlines()[:12]:
+            self.console.print(f"  │ {line}")
+        if len(content) > 300 or len(preview.splitlines()) > 12:
+            self.console.print("  │ [dim]...[/dim]")
+
+    def _print_replace_preview(self, old: str, new: str) -> None:
+        old_preview = old if len(old) <= 120 else f"{old[:120]}..."
+        new_preview = new if len(new) <= 120 else f"{new[:120]}..."
+        self.console.print(f"  old: {old_preview}")
+        self.console.print(f"  new: {new_preview}")
+
+    def _print_translation_options(self, arguments: dict[str, Any]) -> None:
+        for key in ("target_language", "source_language", "output_format"):
+            value = arguments.get(key)
+            if value:
+                self.console.print(f"  {key}: {value}")
+        for key in ("bilingual", "dry_run", "fast", "recursive", "overwrite"):
+            value = arguments.get(key)
+            if value:
+                self.console.print(f"  {key}: {value}")
 
     def _handle_plan_command(self, rest: str) -> None:
         option = rest.strip().lower()

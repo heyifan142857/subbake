@@ -136,9 +136,6 @@ class MockBackend(LLMBackend):
                 ],
                 "edit_notes": "Mock edit kept subtitles unchanged.",
             }
-        elif task == "agent_decide":
-            context = json.loads(_extract_between(prompt, "AGENT_CONTEXT_JSON_START", "AGENT_CONTEXT_JSON_END"))
-            result = _mock_agent_decision(context)
         elif task == "agent_loop_decide":
             context = json.loads(_extract_between(prompt, "AGENT_LOOP_CONTEXT_JSON_START", "AGENT_LOOP_CONTEXT_JSON_END"))
             result = _mock_agent_loop_decision(context)
@@ -585,99 +582,6 @@ def _contains_latin(text: str) -> bool:
 
 def _contains_cjk(text: str) -> bool:
     return re.search(r"[\u4e00-\u9fff]", text) is not None
-
-
-def _mock_agent_decision(context: dict[str, Any]) -> dict[str, Any]:
-    message = str(context.get("user_message") or "")
-    lowered = message.casefold()
-    references = [
-        item for item in context.get("references", [])
-        if isinstance(item, dict)
-    ]
-    mode = str(context.get("mode") or "chat")
-
-    def decision(tool_name: str, arguments: dict[str, Any], text: str = "Running tool.") -> dict[str, Any]:
-        if mode == "plan":
-            return {
-                "action": "plan",
-                "message": f"Plan:\n- {text}",
-                "tool_calls": [{"tool_name": tool_name, "arguments": arguments}],
-            }
-        return {
-            "action": "tool_call",
-            "message": text,
-            "tool_name": tool_name,
-            "arguments": arguments,
-        }
-
-    if any(word in lowered for word in ("profile", "model", "模型", "配置")) and "切" in message:
-        profile = _last_word(message)
-        return decision("switch_profile", {"profile": profile}, f"Switching profile to {profile}.")
-
-    if references and any(word in lowered for word in ("分析", "诊断", "错误", "失败", "log", "error", "diagnose")):
-        return decision("diagnose_path", {"path": references[0]["path"]}, "Diagnosing failure log.")
-
-    if references and _looks_like_edit_request(message, references[0]):
-        instruction = _remove_mock_refs(message).strip() or message
-        return decision(
-            "edit_subtitle",
-            {"path": references[0]["path"], "instruction": instruction},
-            "Editing generated subtitle.",
-        )
-
-    if any(word in lowered for word in ("删除", "delete", "remove")) and references:
-        return decision("delete_file", {"path": references[0]["path"]}, "Deleting file.")
-
-    if any(word in lowered for word in ("改名", "rename", "重命名")):
-        if len(references) >= 2:
-            return decision(
-                "rename_path",
-                {"old_path": references[0]["path"], "new_path": references[1]["path"]},
-                "Renaming file.",
-            )
-        return {"action": "ask_user", "message": "Which source and destination paths should I use?"}
-
-    if any(word in lowered for word in ("追加", "append")) and references:
-        return decision(
-            "append_file",
-            {"path": references[0]["path"], "content": _content_after_refs(message)},
-            "Appending file.",
-        )
-
-    if any(word in lowered for word in ("替换", "replace")) and references and "=>" in message:
-        old, _, new = _content_after_refs(message).partition("=>")
-        return decision(
-            "replace_in_file",
-            {"path": references[0]["path"], "old": old.strip(), "new": new.strip()},
-            "Replacing text.",
-        )
-
-    if any(word in lowered for word in ("创建", "create", "新建")) and references:
-        return decision(
-            "create_file",
-            {"path": references[0]["path"], "content": _content_after_refs(message)},
-            "Creating file.",
-        )
-
-    if references and any(word in lowered for word in ("读取", "查看", "read", "show")):
-        return decision("read_file", {"path": references[0]["path"]}, "Reading file.")
-
-    if references and any(word in lowered for word in ("搜索", "search", "查找")):
-        return decision("search_files", {"path": references[0]["path"], "pattern": _last_word(message)}, "Searching files.")
-
-    if references:
-        first = references[0]
-        if first.get("is_dir"):
-            return decision("translate_series", {"path": first["path"]}, "Translating subtitle folder.")
-        suffix = str(first.get("suffix") or "").lower()
-        if suffix in {".srt", ".vtt", ".txt"}:
-            return decision("translate_file", {"path": first["path"]}, "Translating subtitle file.")
-        return decision("diagnose_path", {"path": first["path"]}, "Diagnosing referenced file.")
-
-    return {
-        "action": "respond",
-        "message": "I can help with subtitle translation, diagnostics, profiles, and project-local file changes. Reference files with @path.",
-    }
 
 
 def _mock_agent_loop_decision(context: dict[str, Any]) -> dict[str, Any]:
