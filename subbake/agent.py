@@ -2432,7 +2432,7 @@ class SubBakeAgent:
                     "  创建 @notes.txt 记录 Alice 译作爱丽丝",
                     "",
                     "Controls:",
-                    "  Tab / Right             complete slash commands & autocomplete",
+                    "  Tab                    complete slash commands & autocomplete",
                     "  Shift+Tab               toggle plan mode",
                     "  /model or /profile      choose a model profile",
                     "  /model <profile>        switch profile directly",
@@ -2561,7 +2561,6 @@ class SubBakeAgent:
                 buffer.apply_completion(completion)
 
         key_bindings.add("tab")(_do_complete)
-        key_bindings.add("right")(_do_complete)
 
         @key_bindings.add("down", filter=has_completions)
         def _next_completion(event) -> None:
