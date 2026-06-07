@@ -26,6 +26,10 @@ This file tracks notable changes for each release.
 - `.gitignore` now excludes `CLAUDE.md` from version control.
 - The `read_file` tool moved from the `file_operation` category to `browse`, since it is a non-mutating operation.
 - Agent loop context uses compact `to_context_dict()` representations with summaries instead of full observation dumps, reducing prompt bloat.
+- **Second-wave module extraction**: `_core.py` reduced from ~2340 to ~746 lines by extracting 10 new modules into the `agent/` package — `deterministic.py` (deterministic tool execution), `discovery.py` (file discovery), `executor.py` (tool dispatch), `intent.py` (intent classification), `plan.py` (plan mode), `profile.py` (profile management), `session_ops.py` (session persistence), `target.py` (target resolution), `text_helpers.py` (text utilities), and `undo.py` (undo support). Remaining `_core.py` focuses solely on agent session lifecycle and the main loop entrypoint.
+- UI helpers (`select_from_list`, `prompt_text`, `console_choose`) extracted from `_core.py` into `ui.py` as standalone functions, eliminating tight coupling to the agent instance.
+- Re-exports in `agent/__init__.py` reorganized to reflect the new module layout — constants and helper functions re-exported from their owning modules (`intent`, `profile`) instead of `_core`.
+- Tests updated to use new import paths: `profile` tests call `create_profile_interactively`/`offer_config_bootstrap` via `subbake.agent.profile`, and intent-gate tests call standalone functions (`_mock_classify_intent`, `_fallback_intent_classification`, `apply_confidence_gate`, `intent_to_decision`) from `subbake.agent.intent` instead of agent instance methods.
 
 ### Fixed
 

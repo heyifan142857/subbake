@@ -8,11 +8,17 @@ from unittest.mock import patch
 
 from subbake.agent import (
     SubBakeAgent,
+    TOOL_CATEGORIES,
+    ALWAYS_AVAILABLE_TOOLS,
+)
+from subbake.agent.intent import (
     CONFIDENCE_LOW_THRESHOLD,
     CONFIDENCE_MEDIUM_THRESHOLD,
     CONFIDENCE_MIN_OBSERVATIONS,
-    TOOL_CATEGORIES,
-    ALWAYS_AVAILABLE_TOOLS,
+    _fallback_intent_classification,
+    _mock_classify_intent,
+    apply_confidence_gate,
+    intent_to_decision,
 )
 from rich.console import Console
 
@@ -39,7 +45,7 @@ class IntentGateMockClassificationTestCase(TestCase):
 
     def test_translate_file_with_reference(self):
         line = "翻译 @episode.srt 成英文"
-        intent = self.agent._mock_classify_intent(line)
+        intent = _mock_classify_intent(self.agent, line)
         self.assertIsNotNone(intent)
         self.assertEqual(intent["category"], "translate_file")
         self.assertIn("episode.srt", intent["parameters"].get("path", ""))
@@ -48,25 +54,25 @@ class IntentGateMockClassificationTestCase(TestCase):
         dir_path = Path("Season01")
         dir_path.mkdir()
         line = "翻译 @Season01"
-        intent = self.agent._mock_classify_intent(line)
+        intent = _mock_classify_intent(self.agent, line)
         self.assertIsNotNone(intent)
         self.assertEqual(intent["category"], "translate_series")
 
     def test_edit_subtitle_with_generated_file(self):
         line = "请修改 @episode.translated.srt 把角色名统一一下"
-        intent = self.agent._mock_classify_intent(line)
+        intent = _mock_classify_intent(self.agent, line)
         self.assertIsNotNone(intent)
         self.assertEqual(intent["category"], "edit_subtitle")
         self.assertIn("episode.translated.srt", intent["parameters"].get("path", ""))
 
     def test_ambiguous_request_returns_none(self):
         line = "你好，有什么功能？"
-        intent = self.agent._mock_classify_intent(line)
+        intent = _mock_classify_intent(self.agent, line)
         self.assertIsNone(intent)
 
     def test_matrix_request_returns_none(self):
         line = "The Matrix"
-        intent = self.agent._mock_classify_intent(line)
+        intent = _mock_classify_intent(self.agent, line)
         self.assertIsNone(intent)
 
 
@@ -87,7 +93,7 @@ class IntentGateDecisionTestCase(TestCase):
 
     def test_chat_returns_respond(self):
         intent = {"category": "chat", "parameters": {}, "confidence": 0.5, "reason": "test"}
-        decision = self.agent._intent_to_decision(intent, "hello")
+        decision = intent_to_decision(self.agent, intent, "hello", run_agent_loop=lambda *a, **kw: {}, agent_loop_max_steps=5)
         self.assertEqual(decision["action"], "respond")
 
     def test_high_confidence_with_path_skips_agent_loop(self):
@@ -97,7 +103,7 @@ class IntentGateDecisionTestCase(TestCase):
             "confidence": 0.9,
             "reason": "test",
         }
-        decision = self.agent._intent_to_decision(intent, "translate test.srt")
+        decision = intent_to_decision(self.agent, intent, "translate test.srt", run_agent_loop=lambda *a, **kw: {}, agent_loop_max_steps=5)
         self.assertEqual(decision["action"], "final_tool_call")
         self.assertEqual(decision["tool_name"], "translate_file")
 
@@ -109,7 +115,7 @@ class IntentGateDecisionTestCase(TestCase):
             "confidence": 0.9,
             "reason": "test",
         }
-        decision = self.agent._intent_to_decision(intent, "edit test.srt")
+        decision = intent_to_decision(self.agent, intent, "edit test.srt", run_agent_loop=lambda *a, **kw: {}, agent_loop_max_steps=5)
         # Should NOT be final_tool_call (direct execution) since instruction is missing
         self.assertNotEqual(decision.get("action"), "final_tool_call")
 
@@ -120,7 +126,7 @@ class IntentGateDecisionTestCase(TestCase):
             "confidence": 0.3,
             "reason": "uncertain",
         }
-        decision = self.agent._intent_to_decision(intent, "do something")
+        decision = intent_to_decision(self.agent, intent, "do something", run_agent_loop=lambda *a, **kw: {}, agent_loop_max_steps=5)
         self.assertEqual(decision["action"], "ask_user")
 
 
@@ -141,13 +147,13 @@ class FallbackClassificationTestCase(TestCase):
 
     def test_translate_with_ref_in_fallback(self):
         line = "翻译 @test.srt"
-        result = self.agent._fallback_intent_classification(line)
+        result = _fallback_intent_classification(self.agent, line)
         self.assertIsNotNone(result)
         self.assertEqual(result["category"], "translate_file")
 
     def test_ambiguous_fallback_returns_none(self):
         line = "hello world"
-        result = self.agent._fallback_intent_classification(line)
+        result = _fallback_intent_classification(self.agent, line)
         self.assertIsNone(result)
 
 
@@ -169,14 +175,14 @@ class ConfidenceGateTestCase(TestCase):
 
     def test_low_confidence_responds(self):
         decision = {"action": "final_tool_call", "tool_name": "translate_file", "confidence": 0.3}
-        gated = self.agent._apply_confidence_gate(decision, self.state)
+        gated = apply_confidence_gate(decision, self.state)
         self.assertIsNotNone(gated)
         self.assertEqual(gated["action"], "respond")
 
     def test_medium_confidence_without_observations_asks_user(self):
         decision = {"action": "final_tool_call", "tool_name": "translate_file", "confidence": 0.5}
         self.state.observations = []  # no observations
-        gated = self.agent._apply_confidence_gate(decision, self.state)
+        gated = apply_confidence_gate(decision, self.state)
         self.assertIsNotNone(gated)
         self.assertEqual(gated["action"], "ask_user")
 
@@ -188,23 +194,23 @@ class ConfidenceGateTestCase(TestCase):
             AgentObservation(tool_name="list_files", arguments={}, preview="test")
             for _ in range(CONFIDENCE_MIN_OBSERVATIONS)
         ]
-        gated = self.agent._apply_confidence_gate(decision, self.state)
+        gated = apply_confidence_gate(decision, self.state)
         self.assertIsNone(gated)  # passes through
 
     def test_high_confidence_passes(self):
         decision = {"action": "final_tool_call", "tool_name": "translate_file", "confidence": 0.85}
-        gated = self.agent._apply_confidence_gate(decision, self.state)
+        gated = apply_confidence_gate(decision, self.state)
         self.assertIsNone(gated)
 
     def test_tool_call_not_gated(self):
         """Discovery tool_call should not be gated."""
         decision = {"action": "tool_call", "tool_name": "list_files", "confidence": 0.3}
-        gated = self.agent._apply_confidence_gate(decision, self.state)
+        gated = apply_confidence_gate(decision, self.state)
         self.assertIsNone(gated)
 
     def test_no_confidence_data_passes(self):
         decision = {"action": "final_tool_call", "tool_name": "translate_file"}
-        gated = self.agent._apply_confidence_gate(decision, self.state)
+        gated = apply_confidence_gate(decision, self.state)
         self.assertIsNone(gated)
 
 

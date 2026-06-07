@@ -20,6 +20,7 @@ from subbake.agent import (
     NEW_PROFILE_VALUE,
     SubBakeAgent,
 )
+from subbake.agent.profile import create_profile_interactively, offer_config_bootstrap
 from subbake.agent.trace import (
     AGENT_COMMANDS,
     _AgentLoopTrace,
@@ -337,10 +338,10 @@ class CLITestCase(unittest.TestCase):
 
             agent.interactive = True
             with (
-                patch.object(agent, "_select_from_list", return_value=CONFIG_BOOTSTRAP_CREATE) as select,
-                patch.object(agent, "_create_profile_interactively") as create_profile,
+                patch("subbake.agent.profile.select_from_list", return_value=CONFIG_BOOTSTRAP_CREATE) as select,
+                patch("subbake.agent.profile.create_profile_interactively") as create_profile,
             ):
-                agent._maybe_offer_config_bootstrap()
+                offer_config_bootstrap(agent)
 
             select.assert_called_once()
             create_profile.assert_called_once()
@@ -356,8 +357,8 @@ class CLITestCase(unittest.TestCase):
                 agent = SubBakeAgent(console=Console(record=True), resume=False)
                 agent.interactive = True
                 answers = iter(["chatgpt", "openai", "gpt-4o-mini", "OPENAI_API_KEY", "", "Chinese"])
-                with patch.object(agent, "_prompt_text", side_effect=lambda *args, **kwargs: next(answers)):
-                    agent._create_profile_interactively()
+                with patch("subbake.agent.profile.prompt_text", side_effect=lambda *args, **kwargs: next(answers)):
+                    create_profile_interactively(agent)
 
             config = load_app_config(config_path)
             self.assertEqual(agent.profile, "chatgpt")
@@ -374,8 +375,8 @@ class CLITestCase(unittest.TestCase):
             agent = SubBakeAgent(console=Console(record=True), resume=False)
             agent.interactive = True
             answers = iter(["local", "mock", "mock-zh", "", "", "Chinese"])
-            with patch.object(agent, "_prompt_text", side_effect=lambda *args, **kwargs: next(answers)):
-                agent._create_profile_interactively()
+            with patch("subbake.agent.profile.prompt_text", side_effect=lambda *args, **kwargs: next(answers)):
+                create_profile_interactively(agent)
 
             config = load_app_config(config_path)
             self.assertEqual(agent.profile, "local")
@@ -396,8 +397,8 @@ class CLITestCase(unittest.TestCase):
             agent = SubBakeAgent(console=Console(record=True), resume=False)
             agent.interactive = True
             answers = iter(["beta", "mock", "mock-beta", "", "", "Chinese"])
-            with patch.object(agent, "_prompt_text", side_effect=lambda *args, **kwargs: next(answers)):
-                agent._create_profile_interactively()
+            with patch("subbake.agent.profile.prompt_text", side_effect=lambda *args, **kwargs: next(answers)):
+                create_profile_interactively(agent)
 
             config = load_app_config(config_path)
             self.assertEqual(config.default_profile, "alpha")
@@ -413,8 +414,8 @@ class CLITestCase(unittest.TestCase):
             ):
                 agent = SubBakeAgent(console=Console(record=True), resume=False)
                 agent.interactive = True
-                with patch.object(agent, "_prompt_text", return_value=None):
-                    agent._create_profile_interactively()
+                with patch("subbake.agent.profile.prompt_text", return_value=None):
+                    create_profile_interactively(agent)
 
             self.assertFalse(config_path.exists())
             self.assertIsNone(agent.profile)

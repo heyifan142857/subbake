@@ -9,17 +9,23 @@ from __future__ import annotations
 # -- core agent class and constants ----------------------------------------
 from ._core import (  # noqa: I001
     AGENT_LOOP_MAX_STEPS,
-    CONFIG_BOOTSTRAP_CREATE,
-    CONFIG_BOOTSTRAP_SKIP,
+    SubBakeAgent,
+    start_interactive_agent,
+)
+from .intent import (  # noqa: I001
     CONFIDENCE_LOW_THRESHOLD,
     CONFIDENCE_MEDIUM_THRESHOLD,
     CONFIDENCE_MIN_OBSERVATIONS,
+)
+
+# -- profile management -----------------------------------------------------
+from .profile import (  # noqa: I001
+    CONFIG_BOOTSTRAP_CREATE,
+    CONFIG_BOOTSTRAP_SKIP,
     NEW_PROFILE_VALUE,
     PROFILE_API_KEY_ENV_OPTIONS,
     PROFILE_PROVIDER_OPTIONS,
     PROFILE_TARGET_LANGUAGE_OPTIONS,
-    SubBakeAgent,
-    start_interactive_agent,
 )
 
 # -- loop / data structures -------------------------------------------------

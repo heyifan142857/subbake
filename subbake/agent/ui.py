@@ -11,6 +11,12 @@ from typing import Any
 
 from rich.console import Console
 
+from .trace import (
+    PICKER_CANCEL_TOKEN,
+    _prompt_toolkit_inline_picker,
+    _prompt_toolkit_inline_text,
+)
+
 
 def print_translation_start(
     console: Console,
@@ -196,3 +202,81 @@ def _print_translation_options(console: Console, arguments: dict[str, Any]) -> N
         value = arguments.get(key)
         if value:
             console.print(f"  {key}: {value}")
+
+
+# ---------------------------------------------------------------------------
+# Interactive prompting helpers
+# ---------------------------------------------------------------------------
+
+
+def select_from_list(
+    console: Console,
+    interactive: bool,
+    title: str,
+    options: list[tuple[str, str]],
+    *,
+    default: str,
+) -> str | None:
+    """Show an interactive picker if available, otherwise a numbered choice list.
+
+    Returns the selected key (string), or None if cancelled (interactive only).
+    """
+    if not options:
+        return None
+    if interactive:
+        selected = _prompt_toolkit_inline_picker(title, options, default=default)
+        if selected == PICKER_CANCEL_TOKEN:
+            return None
+        if selected:
+            return str(selected)
+    return console_choose(console, interactive, title, options, default=default)
+
+
+def console_choose(
+    console: Console,
+    interactive: bool,
+    title: str,
+    options: list[tuple[str, str]],
+    *,
+    default: str,
+) -> str:
+    """Fallback numbered-choice list when interactive picker is unavailable."""
+    if not interactive:
+        return default
+    console.print(f"[bold green]{title}[/bold green]")
+    for index, (_, label) in enumerate(options, start=1):
+        console.print(f"  {index}. {label}")
+    answer = console.input(f"Choice [default: {default}]: ").strip()
+    if not answer:
+        return default
+    if answer.isdigit():
+        option_index = int(answer) - 1
+        if 0 <= option_index < len(options):
+            return options[option_index][0]
+    allowed = {value for value, _ in options}
+    if answer in allowed:
+        return answer
+    return default
+
+
+def prompt_text(
+    console: Console,
+    interactive: bool,
+    title: str,
+    text: str,
+    *,
+    default: str,
+    completions: tuple[str, ...] = (),
+) -> str | None:
+    """Show an interactive text prompt with auto-completions, falling back to console input."""
+    if interactive:
+        answer = _prompt_toolkit_inline_text(title, text, default=default, completions=completions)
+        if answer == PICKER_CANCEL_TOKEN:
+            return None
+        if answer is not None:
+            return str(answer)
+    if not interactive:
+        return default
+    suffix = f" [default: {default}]" if default else ""
+    answer = console.input(f"{text}{suffix}: ").strip()
+    return answer or default
