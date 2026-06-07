@@ -680,6 +680,65 @@ class CLITestCase(unittest.TestCase):
             self.assertEqual(result.exit_code, 0)
             self.assertIn("[MOCK-ZH] hello", (season / "episode1.translated.txt").read_text(encoding="utf-8"))
 
+    def test_agent_undo_removes_translated_file_output(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("clip.txt").write_text("hello\n", encoding="utf-8")
+
+            result = self.runner.invoke(app, [], input="翻译 @clip.txt\n/undo\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertFalse(Path("clip.translated.txt").exists())
+            self.assertIn("Undo created:", output)
+
+    def test_agent_undo_restores_overwritten_translation_output(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            Path("clip.txt").write_text("hello\n", encoding="utf-8")
+            Path("clip.translated.txt").write_text("previous translation\n", encoding="utf-8")
+
+            result = self.runner.invoke(app, [], input="重新翻译 @clip.txt\n/undo\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(Path("clip.translated.txt").read_text(encoding="utf-8"), "previous translation\n")
+            self.assertIn("Undo modified:", output)
+
+    def test_agent_undo_removes_series_outputs_as_one_group(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n'
+                "final_review = false\n",
+                encoding="utf-8",
+            )
+            season = Path("season")
+            season.mkdir()
+            (season / "episode1.txt").write_text("hello one\n", encoding="utf-8")
+            (season / "episode2.txt").write_text("hello two\n", encoding="utf-8")
+
+            result = self.runner.invoke(app, [], input="翻译 @season\n/undo\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertFalse((season / "episode1.translated.txt").exists())
+            self.assertFalse((season / "episode2.translated.txt").exists())
+            self.assertEqual(output.count("Undo created:"), 2)
+
     def test_agent_current_directory_srt_request_translates_only_srt_series(self) -> None:
         with self._isolated_filesystem():
             Path("subbake.toml").write_text(

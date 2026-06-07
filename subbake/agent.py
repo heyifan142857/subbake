@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -48,7 +49,12 @@ from subbake.runtime_options import (
     build_pipeline_options,
     merge_translation_values,
 )
-from subbake.series import SUPPORTED_SUBTITLE_SUFFIXES, discover_series_files, translate_series
+from subbake.series import (
+    SUPPORTED_SUBTITLE_SUFFIXES,
+    discover_series_files,
+    resolve_series_output_path,
+    translate_series,
+)
 from subbake.title_matching import normalize_title_text, title_tokens_from_text
 from subbake.ui import Dashboard
 
@@ -1415,6 +1421,17 @@ class SubBakeAgent:
             f"{len(files)} file(s), profile={self.profile or 'default'}, "
             f"target={values['target_language']}"
         )
+        undo_snapshots: dict[Path, tuple[bool, Path | None]] = {}
+        if not bool(values["dry_run"]):
+            for file_path in files:
+                output_path = resolve_series_output_path(
+                    file_path,
+                    output_format=values.get("output_format"),
+                    bilingual=bool(values["bilingual"]),
+                )
+                if output_path.exists() and not overwrite:
+                    continue
+                undo_snapshots[output_path] = self._translation_output_undo_snapshot(output_path)
         result = translate_series(
             root=path,
             values=values,
@@ -1442,6 +1459,18 @@ class SubBakeAgent:
                 "output_format": values.get("output_format"),
             },
         )
+        operation_group_id = uuid.uuid4().hex
+        for item in result.processed:
+            if item.output_path is None:
+                continue
+            existed_before, backup_path = undo_snapshots.get(item.output_path, (False, None))
+            self._record_translation_output_file_operation(
+                output_path=item.output_path,
+                original=original,
+                existed_before=existed_before,
+                backup_path=backup_path,
+                group_id=operation_group_id,
+            )
 
     def _edit_generated_subtitle(self, *, target_path: Path, instruction: str, original: str) -> None:
         if not instruction:
@@ -1479,8 +1508,29 @@ class SubBakeAgent:
 
     def _undo_last_operation(self) -> None:
         """Undo the most recent file operation by restoring from its backup."""
-        # Find the most recent file_operation event that wasn't already undone
-        undo_target: dict[str, Any] | None = None
+        undo_target = self._latest_file_operation_to_undo()
+        if undo_target is None:
+            self.console.print("[bold yellow]Nothing to undo.[/bold yellow]")
+            self._record_event("undo", "/undo", {"result": "nothing_to_undo"})
+            return
+
+        undo_targets = self._file_operation_group_targets(undo_target)
+        undone_targets: list[dict[str, Any]] = []
+        for target in undo_targets:
+            if not self._undo_file_operation(target):
+                return
+            target["undone"] = True
+            undone_targets.append(target)
+
+        action = str(undo_target.get("action") or "")
+        path = Path(str(undo_target.get("path") or ""))
+        self._record_event(
+            "undo",
+            "/undo",
+            {"result": "ok", "action": action, "path": str(path), "count": len(undone_targets)},
+        )
+
+    def _latest_file_operation_to_undo(self) -> dict[str, Any] | None:
         for event in reversed(self.session.events):
             if event.get("kind") != "file_operation":
                 continue
@@ -1489,14 +1539,27 @@ class SubBakeAgent:
                 continue
             if data.get("undone"):
                 continue
-            undo_target = data
-            break
+            return data
+        return None
 
-        if undo_target is None:
-            self.console.print("[bold yellow]Nothing to undo.[/bold yellow]")
-            self._record_event("undo", "/undo", {"result": "nothing_to_undo"})
-            return
+    def _file_operation_group_targets(self, undo_target: dict[str, Any]) -> list[dict[str, Any]]:
+        group_id = str(undo_target.get("group_id") or "")
+        if not group_id:
+            return [undo_target]
+        targets: list[dict[str, Any]] = []
+        for event in self.session.events:
+            if event.get("kind") != "file_operation":
+                continue
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+            if data.get("undone"):
+                continue
+            if data.get("group_id") == group_id:
+                targets.append(data)
+        return list(reversed(targets))
 
+    def _undo_file_operation(self, undo_target: dict[str, Any]) -> bool:
         action = str(undo_target.get("action") or "")
         path = Path(str(undo_target.get("path") or ""))
         new_path_str = str(undo_target.get("new_path") or "")
@@ -1516,7 +1579,7 @@ class SubBakeAgent:
                     f"[bold yellow]Backup not found for {action}:[/bold yellow] {path}. Cannot undo."
                 )
                 self._record_event("undo", "/undo", {"result": "backup_missing", "path": str(path)})
-                return
+                return False
             if action == "renamed":
                 new_path = Path(new_path_str) if new_path_str else None
                 if new_path is not None and new_path.exists():
@@ -1535,7 +1598,7 @@ class SubBakeAgent:
                     f"[bold yellow]Backup not found for deleted file:[/bold yellow] {path}. Cannot undo."
                 )
                 self._record_event("undo", "/undo", {"result": "backup_missing", "path": str(path)})
-                return
+                return False
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(backup, path)
             self.console.print(f"[bold green]Undo deleted:[/bold green] restored {path}")
@@ -1543,11 +1606,9 @@ class SubBakeAgent:
         else:
             self.console.print(f"[bold yellow]Unknown operation type:[/bold yellow] {action}")
             self._record_event("undo", "/undo", {"result": "unknown_action", "action": action})
-            return
+            return False
 
-        # Mark the operation as undone so repeated /undo skips it
-        undo_target["undone"] = True
-        self._record_event("undo", "/undo", {"result": "ok", "action": action, "path": str(path)})
+        return True
 
     def _record_file_op_event(self, result: FileOpResult, original: str) -> None:
         self._record_event(
@@ -1560,6 +1621,48 @@ class SubBakeAgent:
                 "backup_path": str(result.backup_path) if result.backup_path is not None else None,
             },
         )
+
+    def _translation_output_undo_snapshot(self, output_path: Path) -> tuple[bool, Path | None]:
+        if not output_path.exists():
+            return False, None
+        return True, self._backup_translation_output_for_undo(output_path)
+
+    def _backup_translation_output_for_undo(self, output_path: Path) -> Path:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        resolved_output = output_path.resolve()
+        resolved_root = self.project_root.resolve()
+        try:
+            relative = resolved_output.relative_to(resolved_root)
+        except ValueError:
+            digest = hashlib.sha1(str(resolved_output).encode("utf-8")).hexdigest()[:12]
+            relative = Path("__external__") / digest / output_path.name
+        backup_path = self.project_root / ".subbake" / "agent" / "backups" / timestamp / relative
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        if backup_path.exists():
+            backup_path = backup_path.with_name(
+                f"{backup_path.stem}-{output_path.stat().st_mtime_ns}{backup_path.suffix}"
+            )
+        shutil.copy2(output_path, backup_path)
+        return backup_path
+
+    def _record_translation_output_file_operation(
+        self,
+        *,
+        output_path: Path,
+        original: str,
+        existed_before: bool,
+        backup_path: Path | None,
+        group_id: str | None = None,
+    ) -> None:
+        data: dict[str, Any] = {
+            "action": "modified" if existed_before else "created",
+            "path": str(output_path),
+        }
+        if backup_path is not None:
+            data["backup_path"] = str(backup_path)
+        if group_id is not None:
+            data["group_id"] = group_id
+        self._record_event("file_operation", original, data)
 
     def _reference_context(self, line: str) -> list[dict[str, Any]]:
         references: list[dict[str, Any]] = []
@@ -2186,11 +2289,17 @@ class SubBakeAgent:
             output_path=None,
             values=values,
         )
-        result = SubtitlePipeline(
+        pipeline = SubtitlePipeline(
             backend=backend,
             options=options,
             dashboard=Dashboard(console=self.console),
-        ).run()
+        )
+        existed_before, backup_path = (
+            self._translation_output_undo_snapshot(pipeline.output_path)
+            if not options.dry_run
+            else (False, None)
+        )
+        result = pipeline.run()
         if result.dry_run:
             self.console.print(f"[bold yellow]Dry run:[/bold yellow] {len(result.planned_batches)} batch(es) planned.")
             self._print_file_completion(output_path=None, dry_run=True)
@@ -2209,6 +2318,13 @@ class SubBakeAgent:
                 "output_format": values.get("output_format"),
             },
         )
+        if result.output_path is not None and not result.dry_run:
+            self._record_translation_output_file_operation(
+                output_path=result.output_path,
+                original=original,
+                existed_before=existed_before,
+                backup_path=backup_path,
+            )
 
     def _print_file_op_result(self, result: FileOpResult) -> None:
         if result.action == "renamed" and result.new_path is not None:
