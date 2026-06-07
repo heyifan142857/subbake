@@ -391,9 +391,27 @@ def _stable_hash(payload: Any) -> str:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
     temp_path = path.with_name(f"{path.name}.tmp")
-    temp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    temp_path.write_text(serialized, encoding="utf-8")
     temp_path.replace(path)
+    _verify_json_write(path, payload)
+
+
+def _verify_json_write(path: Path, expected_payload: Any) -> None:
+    """Read back a just-written JSON file and verify it matches the expected payload."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OSError(f"Write verification failed: cannot read back {path}: {exc}") from exc
+    if not raw.strip():
+        raise OSError(f"Write verification failed: {path} is empty after write")
+    try:
+        actual = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise OSError(f"Write verification failed: {path} contains invalid JSON: {exc}") from exc
+    if actual != expected_payload:
+        raise OSError(
+            f"Write verification failed for {path}: "
+            f"deserialized content does not match expected payload"
+        )

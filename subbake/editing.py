@@ -80,6 +80,7 @@ def edit_generated_subtitle(
         output_format=target_document.format,
     )
     target_path.write_text(rendered, encoding="utf-8")
+    _verify_write_text(target_path, rendered)
 
     translation_memory_path = None
     if source_document is not None:
@@ -193,4 +194,40 @@ def _write_edit_note(translation_memory_path: Path, source_path: Path) -> None:
         }
     )
     note_path.parent.mkdir(parents=True, exist_ok=True)
-    note_path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+    serialized = json.dumps(entries, ensure_ascii=False, indent=2)
+    note_path.write_text(serialized, encoding="utf-8")
+    _verify_json_write(note_path, serialized)
+
+
+def _verify_write_text(path: Path, expected: str) -> None:
+    """Read back a just-written file and verify its content matches exactly."""
+    try:
+        actual = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OSError(f"Write verification failed: cannot read back {path}: {exc}") from exc
+    if actual != expected:
+        raise OSError(
+            f"Write verification failed for {path}: "
+            f"content mismatch (expected {len(expected)} bytes, "
+            f"got {len(actual)} bytes)"
+        )
+
+
+def _verify_json_write(path: Path, expected_serialized: str) -> None:
+    """Read back a just-written JSON file and verify it contains valid, matching JSON."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OSError(f"Write verification failed: cannot read back {path}: {exc}") from exc
+    if not raw.strip():
+        raise OSError(f"Write verification failed: {path} is empty after write")
+    if raw != expected_serialized:
+        raise OSError(
+            f"Write verification failed for {path}: "
+            f"content mismatch (expected {len(expected_serialized)} bytes, "
+            f"got {len(raw)} bytes)"
+        )
+    try:
+        json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise OSError(f"Write verification failed: {path} contains invalid JSON: {exc}") from exc

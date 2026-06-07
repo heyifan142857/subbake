@@ -211,6 +211,7 @@ class SubtitlePipeline:
             )
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
             self.output_path.write_text(rendered, encoding="utf-8")
+            _verify_write_text(self.output_path, rendered)
             self.dashboard.mark_done("WRITE_OUTPUT")
             self.dashboard.clear_batch()
             self._save_run_state(
@@ -1958,3 +1959,17 @@ class SubtitlePipeline:
         if self.backend is None:
             raise RuntimeError("No backend configured. Disable --dry-run or provide a backend.")
         return self.backend
+
+
+def _verify_write_text(path: Path, expected: str) -> None:
+    """Read back a just-written file and verify its content matches exactly."""
+    try:
+        actual = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OSError(f"Write verification failed: cannot read back {path}: {exc}") from exc
+    if actual != expected:
+        raise OSError(
+            f"Write verification failed for {path}: "
+            f"content mismatch (expected {len(expected)} bytes, "
+            f"got {len(actual)} bytes)"
+        )

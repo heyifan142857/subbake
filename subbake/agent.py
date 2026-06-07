@@ -177,7 +177,9 @@ class AgentSessionStore:
         session.updated_at = _now_iso()
         self.root.mkdir(parents=True, exist_ok=True)
         path = self.path_for(session.id)
-        path.write_text(json.dumps(session.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        serialized = json.dumps(session.to_dict(), ensure_ascii=False, indent=2)
+        path.write_text(serialized, encoding="utf-8")
+        _verify_write_text(path, serialized)
         return path
 
     def latest(self) -> AgentSession | None:
@@ -2511,7 +2513,9 @@ class SubBakeAgent:
             if value:
                 lines.append(f"{key} = {_toml_string(value)}")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(prefix + "\n".join(lines) + "\n", encoding="utf-8")
+        content = prefix + "\n".join(lines) + "\n"
+        path.write_text(content, encoding="utf-8")
+        _verify_write_text(path, content)
 
     def _print_profiles(self, *, include_new: bool = False) -> None:
         if self.config is None or not self.config.profiles:
@@ -3413,3 +3417,17 @@ def _short_title(value: str, *, limit: int = 72) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _verify_write_text(path: Path, expected: str) -> None:
+    """Read back a just-written file and verify its content matches exactly."""
+    try:
+        actual = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OSError(f"Write verification failed: cannot read back {path}: {exc}") from exc
+    if actual != expected:
+        raise OSError(
+            f"Write verification failed for {path}: "
+            f"content mismatch (expected {len(expected)} bytes, "
+            f"got {len(actual)} bytes)"
+        )

@@ -31,6 +31,7 @@ class FileOperationGuard:
             raise ValueError(f"File already exists: {safe_path}")
         safe_path.parent.mkdir(parents=True, exist_ok=True)
         safe_path.write_text(content, encoding="utf-8")
+        _verify_write_text(safe_path, content)
         return FileOpResult(action="created", path=safe_path)
 
     def read_file(self, path: Path, *, limit: int = 12000) -> str:
@@ -93,7 +94,9 @@ class FileOperationGuard:
         backup_path = self._backup_path(safe_path)
         text = safe_path.read_text(encoding="utf-8")
         prefix = "" if not text else "\n"
-        safe_path.write_text(text + prefix + content, encoding="utf-8")
+        expected = text + prefix + content
+        safe_path.write_text(expected, encoding="utf-8")
+        _verify_write_text(safe_path, expected)
         return FileOpResult(action="appended", path=safe_path, backup_path=backup_path)
 
     def replace_in_file(self, path: Path, old: str, new: str) -> FileOpResult:
@@ -106,6 +109,7 @@ class FileOperationGuard:
         backup_path = self._backup_path(safe_path)
         replaced = text.replace(old, new, 1)
         safe_path.write_text(replaced, encoding="utf-8")
+        _verify_write_text(safe_path, replaced)
         return FileOpResult(action="modified", path=safe_path, backup_path=backup_path)
 
     def rename_path(self, old_path: Path, new_path: Path) -> FileOpResult:
@@ -118,6 +122,10 @@ class FileOperationGuard:
         backup_path = self._backup_path(safe_old_path)
         safe_new_path.parent.mkdir(parents=True, exist_ok=True)
         safe_old_path.rename(safe_new_path)
+        if safe_old_path.exists():
+            raise OSError(f"Rename verification failed: source still exists at {safe_old_path}")
+        if not safe_new_path.exists():
+            raise OSError(f"Rename verification failed: destination not found at {safe_new_path}")
         return FileOpResult(action="renamed", path=safe_old_path, new_path=safe_new_path, backup_path=backup_path)
 
     def delete_file(self, path: Path) -> FileOpResult:
@@ -128,6 +136,8 @@ class FileOperationGuard:
             raise ValueError("Agent file deletion only supports files, not directories.")
         backup_path = self._backup_path(safe_path)
         safe_path.unlink()
+        if safe_path.exists():
+            raise OSError(f"Delete verification failed: file still exists at {safe_path}")
         return FileOpResult(action="deleted", path=safe_path, backup_path=backup_path)
 
     def _require_text_file(self, path: Path) -> Path:
@@ -191,3 +201,17 @@ class FileOperationGuard:
 
 def _matches_any(expressions: list[re.Pattern[str]], value: str) -> bool:
     return any(expression.search(value) for expression in expressions)
+
+
+def _verify_write_text(path: Path, expected: str) -> None:
+    """Read back a just-written file and verify its content matches exactly."""
+    try:
+        actual = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OSError(f"Write verification failed: cannot read back {path}: {exc}") from exc
+    if actual != expected:
+        raise OSError(
+            f"Write verification failed for {path}: "
+            f"content mismatch (expected {len(expected)} bytes, "
+            f"got {len(actual)} bytes)"
+        )
