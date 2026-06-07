@@ -160,7 +160,7 @@ class ConfidenceGateTestCase(TestCase):
         os.chdir(self._tmpdir)
         from subbake.agent import SubBakeAgent
         from rich.console import Console
-        from subbake.agent_loop import AgentLoopState
+        from subbake.agent.loop import AgentLoopState
         self.agent = SubBakeAgent(console=Console(), resume=False)
         self.state = AgentLoopState(original_user_message="test", allowed_tools=("list_files",))
 
@@ -183,7 +183,7 @@ class ConfidenceGateTestCase(TestCase):
     def test_medium_confidence_with_observations_passes(self):
         decision = {"action": "final_tool_call", "tool_name": "translate_file", "confidence": 0.5}
         # Add enough observations
-        from subbake.agent_loop import AgentObservation
+        from subbake.agent.loop import AgentObservation
         self.state.observations = [
             AgentObservation(tool_name="list_files", arguments={}, preview="test")
             for _ in range(CONFIDENCE_MIN_OBSERVATIONS)

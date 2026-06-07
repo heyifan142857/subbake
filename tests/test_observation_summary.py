@@ -1,7 +1,7 @@
 """Tests for agent observation summarization."""
 
 from unittest import TestCase
-from subbake.agent_loop import AgentObservation
+from subbake.agent.loop import AgentObservation
 
 
 class ObservationSummaryUnitTestCase(TestCase):

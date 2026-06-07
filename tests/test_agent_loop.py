@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from subbake.agent_loop import rank_file_candidates
+from subbake.agent.loop import rank_file_candidates
 
 
 class AgentLoopScoringTestCase(unittest.TestCase):

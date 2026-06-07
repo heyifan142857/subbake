@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.text import Text
 
 from subbake import __version__
-from subbake.agent_loop import (
+from .loop import (
     DISCOVERY_TOOL_NAMES,
     AgentLoopState,
     AgentLoopStep,
@@ -29,15 +29,87 @@ from subbake.agent_loop import (
     rank_file_candidates,
     strong_subtitle_candidates,
 )
+from .ui import (
+    print_file_completion,
+    print_file_op_result,
+    print_help as _print_help_fn,
+    print_series_completion,
+    print_series_summary,
+    print_tool_call_preview,
+    print_translation_start,
+    render_mode_label,
+)
+from .session import AgentSession, AgentSessionStore, SESSION_VERSION
+from .arg_parser import (
+    arguments_with_text_overrides,
+    bilingual_requested,
+    bool_argument,
+    language_phrases,
+    line_without_output_format_phrases,
+    monolingual_requested,
+    output_format_from_argument,
+    output_format_from_text,
+    output_format_patterns,
+    resolve_user_path,
+    series_suffixes_from_argument,
+    series_suffixes_from_text,
+    source_language_from_text,
+    target_language_for_bilingual_pair,
+    target_language_from_text,
+    title_tokens_from_text,
+    translation_arguments_from_text,
+    translation_values_for_tool,
+)
+from .tool_registry import (
+    ALWAYS_AVAILABLE_TOOLS,
+    TOOL_CATEGORIES,
+    build_tool_specs,
+)
+from .trace import (
+    AGENT_COMMANDS,
+    PICKER_CANCEL_TOKEN,
+    PickerChoice,
+    REFERENCE_RE,
+    _AgentLoopTrace,
+    _current_completion,
+    _default_api_key_env,
+    _language_phrases,
+    _matching_picker_choices,
+    _now_iso,
+    _output_format_patterns,
+    _picker_choice,
+    _picker_choices,
+    _picker_display_parts,
+    _picker_prompt,
+    _picker_toolbar,
+    _prepend_default_profile,
+    _prompt_toolkit_inline_picker,
+    _prompt_toolkit_inline_text,
+    _prompt_toolkit_prompt,
+    _resolve_picker_selection,
+    _resolve_text_prompt_value,
+    _short_title,
+    _slash_command_completer,
+    _slash_command_matches,
+    _text_prompt,
+    _text_prompt_matches,
+    _text_prompt_toolbar,
+    _toml_key,
+    _toml_string,
+    _trace_arguments,
+    _trace_value,
+    _unique_slash_command_match,
+    _verify_write_text,
+)
 from subbake.config import (
     AppConfig,
     TRANSLATE_CONFIG_KEYS,
-    discover_config_path,
-    discover_project_config_path,
-    global_config_candidates,
     load_app_config,
     resolve_command_config,
 )
+# discover_config_path, discover_project_config_path, global_config_candidates
+# are accessed via _config module reference so that tests can patch the source module.
+from subbake import config as _config
 from subbake.diagnostics import diagnose_path, diagnose_text, format_diagnostic_report
 from subbake.editing import edit_generated_subtitle, is_generated_subtitle
 from subbake.file_ops import FileOpResult, FileOperationGuard
@@ -45,10 +117,12 @@ from subbake.pipeline import SubtitlePipeline
 from subbake.models import build_backend
 from subbake.models.base_model import MockBackend
 from subbake.runtime_options import (
-    build_backend_from_values,
     build_pipeline_options,
     merge_translation_values,
 )
+# build_backend_from_values is accessed via _runtime_options module reference
+# so that tests can patch the source module.
+from subbake import runtime_options as _runtime_options
 from subbake.series import (
     SUPPORTED_SUBTITLE_SUFFIXES,
     discover_series_files,
@@ -58,158 +132,31 @@ from subbake.series import (
 from subbake.title_matching import normalize_title_text, title_tokens_from_text
 from subbake.ui import Dashboard
 
-SESSION_VERSION = 1
 AGENT_LOOP_MAX_STEPS = 5
 
 CONFIDENCE_LOW_THRESHOLD = 0.4
 CONFIDENCE_MEDIUM_THRESHOLD = 0.7
 CONFIDENCE_MIN_OBSERVATIONS = 2
 
-TOOL_CATEGORIES: dict[str, list[str]] = {
-    "translate_file": ["translate_file"],
-    "translate_series": ["translate_series"],
-    "edit_subtitle": ["edit_subtitle"],
-    "diagnose": ["diagnose_path", "diagnose_text"],
-    "file_operation": ["create_file", "append_file", "replace_in_file", "rename_path", "delete_file"],
-    "browse": ["list_files", "search_files", "read_file", "read_file_preview", "candidate_subtitles"],
-    "profile": ["switch_profile", "list_profiles"],
-    "chat": [],
-}
-ALWAYS_AVAILABLE_TOOLS: tuple[str, ...] = (
-    "list_files", "search_files", "read_file_preview", "recent_translations", "candidate_subtitles",
-)
-
-REFERENCE_RE = re.compile(r"@(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
-AGENT_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("/help", "show agent help"),
-    ("/model", "choose a model profile"),
-    ("/profile", "choose a model profile"),
-    ("/session", "choose a session"),
-    ("/sessions", "list recent sessions"),
-    ("/clear", "start a new session"),
-    ("/plan", "turn plan mode on"),
-    ("/plan off", "turn plan mode off"),
-    ("/approve", "execute the pending plan"),
-    ("/reject", "discard the pending plan"),
-    ("/undo", "undo the last file operation"),
-    ("/resume", "resume the latest session"),
-    ("/exit", "quit"),
-    ("/quit", "quit"),
-)
+# TOOL_CATEGORIES, ALWAYS_AVAILABLE_TOOLS imported from .tool_registry
+# REFERENCE_RE imported from .trace
+# AGENT_COMMANDS imported from .trace
 NEW_PROFILE_VALUE = "__subbake_new_profile__"
 CONFIG_BOOTSTRAP_CREATE = "create"
 CONFIG_BOOTSTRAP_SKIP = "skip"
-PICKER_CANCEL_TOKEN = "__subbake_picker_cancelled__"
+PICKER_CANCEL_TOKEN = "__subbake_picker_cancelled__"  # also in agent_trace; kept for internal use
 PROFILE_PROVIDER_OPTIONS = ("mock", "openai", "anthropic", "gemini", "openai-compatible")
 PROFILE_TARGET_LANGUAGE_OPTIONS = ("Chinese", "zh", "en", "ja", "ko", "fr", "es", "de")
 PROFILE_API_KEY_ENV_OPTIONS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY")
-
-
-@dataclass(slots=True)
-class PickerChoice:
-    value: str
-    label: str
-    completion_text: str
-    display: str
-    meta: str
-    search_text: str
-
-
-@dataclass(slots=True)
-class AgentSession:
-    id: str
-    created_at: str
-    updated_at: str
-    cwd: str
-    profile: str | None = None
-    config_path: str | None = None
-    mode: str = "chat"
-    pending_plan: dict[str, Any] | None = None
-    events: list[dict[str, Any]] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "version": SESSION_VERSION,
-            "id": self.id,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "cwd": self.cwd,
-            "profile": self.profile,
-            "config_path": self.config_path,
-            "mode": self.mode,
-            "pending_plan": self.pending_plan,
-            "events": self.events,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "AgentSession":
-        return cls(
-            id=str(data["id"]),
-            created_at=str(data.get("created_at") or _now_iso()),
-            updated_at=str(data.get("updated_at") or _now_iso()),
-            cwd=str(data.get("cwd") or Path.cwd()),
-            profile=data.get("profile") if isinstance(data.get("profile"), str) else None,
-            config_path=data.get("config_path") if isinstance(data.get("config_path"), str) else None,
-            mode=str(data.get("mode") or "chat"),
-            pending_plan=data.get("pending_plan") if isinstance(data.get("pending_plan"), dict) else None,
-            events=list(data.get("events") or []),
-        )
-
-
-class AgentSessionStore:
-    def __init__(self, project_root: Path) -> None:
-        self.root = project_root / ".subbake" / "agent" / "sessions"
-
-    def create(self, *, cwd: Path, profile: str | None, config_path: Path | None) -> AgentSession:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        session_id = f"{timestamp}-{uuid.uuid4().hex[:8]}"
-        return AgentSession(
-            id=session_id,
-            created_at=_now_iso(),
-            updated_at=_now_iso(),
-            cwd=str(cwd),
-            profile=profile,
-            config_path=str(config_path) if config_path is not None else None,
-            mode="chat",
-        )
-
-    def save(self, session: AgentSession) -> Path:
-        session.updated_at = _now_iso()
-        self.root.mkdir(parents=True, exist_ok=True)
-        path = self.path_for(session.id)
-        serialized = json.dumps(session.to_dict(), ensure_ascii=False, indent=2)
-        path.write_text(serialized, encoding="utf-8")
-        _verify_write_text(path, serialized)
-        return path
-
-    def latest(self) -> AgentSession | None:
-        sessions = self.list_sessions()
-        if not sessions:
-            return None
-        return self.load(sessions[-1])
-
-    def list_sessions(self) -> list[Path]:
-        if not self.root.exists():
-            return []
-        return sorted(self.root.glob("*.json"))
-
-    def load(self, path: Path) -> AgentSession:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("version") != SESSION_VERSION:
-            raise ValueError(f"Unsupported agent session version in {path}.")
-        return AgentSession.from_dict(data)
-
-    def path_for(self, session_id: str) -> Path:
-        return self.root / f"{session_id}.json"
 
 
 class SubBakeAgent:
     def __init__(self, *, console: Console, resume: bool = False) -> None:
         self.console = console
         self.cwd = Path.cwd()
-        self.config_path = discover_config_path()
+        self.config_path = _config.discover_config_path()
         self.config = self._load_config(self.config_path)
-        project_config_path = discover_project_config_path()
+        project_config_path = _config.discover_project_config_path()
         self.project_root = project_config_path.parent if project_config_path is not None else self.cwd
         self.store = AgentSessionStore(self.project_root)
         self.interactive = sys.stdin.isatty() and sys.stdout.isatty()
@@ -423,13 +370,7 @@ class SubBakeAgent:
         return arguments
 
     def _series_suffixes_from_text(self, line: str) -> set[str] | None:
-        lowered = self._line_without_output_format_phrases(line).casefold()
-        suffixes = {
-            suffix
-            for suffix in SUPPORTED_SUBTITLE_SUFFIXES
-            if re.search(rf"(?<![a-z0-9])\.?{re.escape(suffix.lstrip('.'))}(?![a-z0-9])", lowered)
-        }
-        return suffixes or None
+        return series_suffixes_from_text(line)
 
     def _translation_retarget_request(
         self,
@@ -535,24 +476,7 @@ class SubBakeAgent:
         return candidates[0]
 
     def _title_tokens_from_text(self, line: str) -> list[str]:
-        cleaned = self._remove_references(line)
-        alias_tokens = title_tokens_from_text(cleaned)
-        spans = re.findall(r"[A-Za-z0-9][A-Za-z0-9 ._'()-]{2,}", cleaned)
-        best = " ".join(alias_tokens)
-        for span in spans:
-            normalized = normalize_title_text(span)
-            tokens = [
-                token
-                for token in normalized.split()
-                if token not in {"the", "a", "an", "to", "of", "and", "or", "can", "could"}
-            ]
-            if len(tokens) >= 2 and len(normalized) > len(best):
-                best = normalized
-        return [
-            token
-            for token in best.split()
-            if token not in {"the", "a", "an", "to", "of", "and", "or", "can", "could"}
-        ]
+        return title_tokens_from_text(line)
 
     def _latest_translation_tool_call(self) -> tuple[str, dict[str, Any]] | None:
         for event in reversed(self.session.events):
@@ -635,7 +559,7 @@ class SubBakeAgent:
 
     def _classify_intent(self, line: str) -> dict[str, Any] | None:
         """Lightweight intent classification. Returns intent dict or None to skip gate."""
-        backend = build_backend_from_values(self.values)
+        backend = _runtime_options.build_backend_from_values(self.values)
         if backend is None:
             return self._fallback_intent_classification(line)
         if isinstance(backend, MockBackend):
@@ -888,7 +812,7 @@ class SubBakeAgent:
         return {"action": "respond", "message": message}
 
     def _decide_loop_next_action(self, state: AgentLoopState, *, show_status: bool = True) -> dict[str, Any]:
-        backend = build_backend_from_values(self.values)
+        backend = _runtime_options.build_backend_from_values(self.values)
         if backend is None:
             raise RuntimeError("Agent conversation requires a model backend.")
         messages = self._build_agent_loop_decision_messages(state)
@@ -1437,7 +1361,7 @@ class SubBakeAgent:
         result = translate_series(
             root=path,
             values=values,
-            backend_factory=lambda: build_backend_from_values(values),
+            backend_factory=lambda: _runtime_options.build_backend_from_values(values),
             console=self.console,
             recursive=recursive,
             overwrite=overwrite,
@@ -1483,7 +1407,7 @@ class SubBakeAgent:
             )
         values = dict(self.values)
         values["dry_run"] = False
-        backend = build_backend_from_values(values)
+        backend = _runtime_options.build_backend_from_values(values)
         if backend is None:
             raise RuntimeError("Subtitle edits require a model backend.")
         result = edit_generated_subtitle(
@@ -1684,386 +1608,40 @@ class SubBakeAgent:
         return references
 
     def _tool_specs(self, categories: list[str] | None = None) -> list[dict[str, Any]]:
-        all_tools = [
-            {
-                "name": "translate_file",
-                "mutating": True,
-                "category": "translate_file",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path to the subtitle file to translate."},
-                        "bilingual": {"type": "boolean", "description": "Output bilingual subtitles (source + translation)."},
-                        "target_language": {"type": "string", "description": "Target language for the translation."},
-                        "source_language": {"type": "string", "description": "Source language; auto-detect if omitted."},
-                        "output_format": {"type": "string", "description": "Output format: srt, vtt, or txt.", "enum": ["srt", "vtt", "txt"]},
-                        "dry_run": {"type": "boolean", "description": "Only plan batches without calling the model."},
-                        "fast": {"type": "boolean", "description": "Skip quality review for speed."},
-                        "final_review": {"type": "boolean", "description": "Enable final consistency review."},
-                    },
-                    "required": ["path"],
-                },
-            },
-            {
-                "name": "translate_series",
-                "mutating": True,
-                "category": "translate_series",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path to the folder containing subtitle files."},
-                        "recursive": {"type": "boolean", "description": "Search subdirectories for subtitle files."},
-                        "overwrite": {"type": "boolean", "description": "Overwrite existing translated output files."},
-                        "dry_run": {"type": "boolean", "description": "Only plan batches without calling the model."},
-                        "suffixes": {"type": "array", "items": {"type": "string"}, "description": "File extensions to include, e.g. .srt .vtt .txt."},
-                        "bilingual": {"type": "boolean", "description": "Output bilingual subtitles."},
-                        "target_language": {"type": "string", "description": "Target language."},
-                        "source_language": {"type": "string", "description": "Source language."},
-                        "output_format": {"type": "string", "description": "Output format: srt, vtt, or txt.", "enum": ["srt", "vtt", "txt"]},
-                        "fast": {"type": "boolean", "description": "Skip quality review for speed."},
-                        "final_review": {"type": "boolean", "description": "Enable final consistency review."},
-                    },
-                    "required": ["path"],
-                },
-            },
-            {
-                "name": "edit_subtitle",
-                "mutating": True,
-                "category": "edit_subtitle",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path to the generated subtitle file to edit."},
-                        "instruction": {"type": "string", "description": "Edit instruction describing the changes to make."},
-                    },
-                    "required": ["path", "instruction"],
-                },
-            },
-            {
-                "name": "diagnose_path",
-                "mutating": False,
-                "category": "diagnose",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path to the failure log or subtitle file to diagnose."},
-                    },
-                    "required": ["path"],
-                },
-            },
-            {
-                "name": "diagnose_text",
-                "mutating": False,
-                "category": "diagnose",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string", "description": "Error text or log content to analyze."},
-                    },
-                    "required": ["text"],
-                },
-            },
-            {
-                "name": "read_file",
-                "mutating": False,
-                "category": "browse",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path to the file to read."},
-                    },
-                    "required": ["path"],
-                },
-            },
-            {
-                "name": "list_files",
-                "mutating": False,
-                "category": "browse",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Directory to list."},
-                        "recursive": {"type": "boolean", "description": "List files in subdirectories."},
-                    },
-                },
-            },
-            {
-                "name": "search_files",
-                "mutating": False,
-                "category": "browse",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Directory to search."},
-                        "pattern": {"type": "string", "description": "Search term or pattern."},
-                    },
-                    "required": ["pattern"],
-                },
-            },
-            {
-                "name": "recent_translations",
-                "mutating": False,
-                "category": "browse",
-                "schema": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "candidate_subtitles",
-                "mutating": False,
-                "category": "browse",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Directory to search for subtitle files."},
-                        "query": {"type": "string", "description": "Search query to match subtitle titles."},
-                    },
-                },
-            },
-            {
-                "name": "read_file_preview",
-                "mutating": False,
-                "category": "browse",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path to the file to preview."},
-                        "limit": {"type": "integer", "description": "Maximum number of characters to read."},
-                    },
-                    "required": ["path"],
-                },
-            },
-            {
-                "name": "create_file",
-                "mutating": True,
-                "category": "file_operation",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path for the new file."},
-                        "content": {"type": "string", "description": "Initial file content."},
-                    },
-                    "required": ["path", "content"],
-                },
-            },
-            {
-                "name": "append_file",
-                "mutating": True,
-                "category": "file_operation",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path to the file to append to."},
-                        "content": {"type": "string", "description": "Content to append."},
-                    },
-                    "required": ["path", "content"],
-                },
-            },
-            {
-                "name": "replace_in_file",
-                "mutating": True,
-                "category": "file_operation",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path to the file to modify."},
-                        "old": {"type": "string", "description": "Text to replace."},
-                        "new": {"type": "string", "description": "Replacement text."},
-                    },
-                    "required": ["path", "old", "new"],
-                },
-            },
-            {
-                "name": "rename_path",
-                "mutating": True,
-                "category": "file_operation",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "old_path": {"type": "string", "description": "Current file path."},
-                        "new_path": {"type": "string", "description": "New file path."},
-                    },
-                    "required": ["old_path", "new_path"],
-                },
-            },
-            {
-                "name": "delete_file",
-                "mutating": True,
-                "category": "file_operation",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path to the file to delete."},
-                    },
-                    "required": ["path"],
-                },
-            },
-            {
-                "name": "list_profiles",
-                "mutating": False,
-                "category": "profile",
-                "schema": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "switch_profile",
-                "mutating": False,
-                "category": "profile",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "profile": {"type": "string", "description": "Name of the profile to switch to."},
-                    },
-                    "required": ["profile"],
-                },
-            },
-        ]
-        if categories is not None:
-            allowed: set[str] = set()
-            for cat in categories:
-                allowed.update(TOOL_CATEGORIES.get(cat, []))
-            allowed.update(ALWAYS_AVAILABLE_TOOLS)
-            return [t for t in all_tools if t["name"] in allowed]
-        return all_tools
+        return build_tool_specs(categories)
 
     def _resolve_user_path(self, value: str) -> Path:
-        if not value:
-            raise ValueError("Tool path argument is required.")
-        path = Path(value).expanduser()
-        if not path.is_absolute():
-            path = self.cwd / path
-        return path
+        return resolve_user_path(value, cwd=self.cwd)
 
     def _series_suffixes_from_argument(self, value: object) -> set[str] | None:
-        if value is None or value == "":
-            return None
-        if isinstance(value, str):
-            raw_suffixes = [value]
-        elif isinstance(value, (list, tuple, set)):
-            raw_suffixes = [str(item) for item in value]
-        else:
-            raise ValueError("Series suffixes must be a string or list of strings.")
-
-        suffixes = {f".{suffix.strip().lower().lstrip('.')}" for suffix in raw_suffixes if suffix.strip()}
-        unsupported = suffixes - SUPPORTED_SUBTITLE_SUFFIXES
-        if unsupported:
-            names = ", ".join(sorted(unsupported))
-            raise ValueError(f"Unsupported series input suffix: {names}")
-        return suffixes or None
+        return series_suffixes_from_argument(value)
 
     def _arguments_with_text_overrides(self, arguments: dict[str, Any], original: str) -> dict[str, Any]:
-        merged = {key: value for key, value in arguments.items() if value is not None}
-        merged.update(self._translation_arguments_from_text(original))
-        return merged
+        return arguments_with_text_overrides(arguments, original)
 
     def _translation_values_for_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        values = dict(self.values)
-        boolean_keys = {"bilingual", "dry_run", "fast", "final_review", "resume", "cache", "agent"}
-        for key in boolean_keys:
-            if key in arguments:
-                parsed = self._bool_argument(arguments[key], key)
-                if parsed is not None:
-                    values[key] = parsed
-
-        for key in ("source_language", "target_language"):
-            value = arguments.get(key)
-            if value is not None and str(value).strip():
-                values[key] = str(value).strip()
-
-        output_format = self._output_format_from_argument(arguments.get("output_format"))
-        if output_format is not None:
-            values["output_format"] = output_format
-        return values
+        return translation_values_for_tool(arguments, self.values)
 
     def _bool_argument(self, value: object, name: str) -> bool | None:
-        if value is None or value == "":
-            return None
-        if isinstance(value, bool):
-            return value
-        normalized = str(value).strip().casefold()
-        if normalized in {"1", "true", "yes", "y", "on"}:
-            return True
-        if normalized in {"0", "false", "no", "n", "off"}:
-            return False
-        raise ValueError(f"Tool argument {name} must be a boolean.")
+        return bool_argument(value, name)
 
     def _output_format_from_argument(self, value: object) -> str | None:
-        if value is None or value == "":
-            return None
-        output_format = str(value).strip().lower().lstrip(".")
-        if f".{output_format}" not in SUPPORTED_SUBTITLE_SUFFIXES:
-            raise ValueError(f"Unsupported output format: {output_format}")
-        return output_format
+        return output_format_from_argument(value)
 
     def _translation_arguments_from_text(self, line: str) -> dict[str, Any]:
-        lowered = line.casefold()
-        arguments: dict[str, Any] = {}
-
-        suffixes = self._series_suffixes_from_text(line)
-        if suffixes is not None:
-            arguments["suffixes"] = sorted(suffixes)
-        if any(word in lowered for word in ("递归", "子目录", "recursive", "subdir")):
-            arguments["recursive"] = True
-        if any(word in lowered for word in ("覆盖", "重新翻译", "overwrite", "retranslate")):
-            arguments["overwrite"] = True
-        if any(word in lowered for word in ("dry run", "dry-run", "只规划", "预览")):
-            arguments["dry_run"] = True
-        if any(word in lowered for word in ("快速", "fast mode", "fast")):
-            arguments["fast"] = True
-        if any(word in lowered for word in ("不要复核", "不复核", "no final review", "without final review")):
-            arguments["final_review"] = False
-        if self._monolingual_requested(line):
-            arguments["bilingual"] = False
-        elif self._bilingual_requested(line):
-            arguments["bilingual"] = True
-
-        source_language = self._source_language_from_text(line)
-        if source_language is not None:
-            arguments["source_language"] = source_language
-        target_language = self._target_language_from_text(line, source_language=source_language)
-        if target_language is not None:
-            arguments["target_language"] = target_language
-        output_format = self._output_format_from_text(line)
-        if output_format is not None:
-            arguments["output_format"] = output_format
-        return arguments
+        return translation_arguments_from_text(line)
 
     def _bilingual_requested(self, line: str) -> bool:
-        lowered = line.casefold()
-        return any(word in lowered for word in ("双语", "中英", "bilingual", "dual-language", "dual language"))
+        return bilingual_requested(line)
 
     def _monolingual_requested(self, line: str) -> bool:
-        lowered = line.casefold()
-        return any(word in lowered for word in ("不要双语", "非双语", "单语", "only translation", "translation only"))
+        return monolingual_requested(line)
 
     def _target_language_from_text(self, line: str, *, source_language: str | None = None) -> str | None:
-        lowered = line.casefold()
-        explicit = re.search(r"(?:target(?: language)?|目标语言)\s*[:=：]\s*([a-zA-Z][a-zA-Z_-]*)", line)
-        if explicit is not None:
-            return explicit.group(1)
-        for phrase, language in _language_phrases():
-            if re.search(rf"(?:翻译|译|translate).{{0,12}}(?:成|到|为|to)\s*{re.escape(phrase)}", lowered):
-                return language
-            if re.search(rf"(?:译成|翻成)\s*{re.escape(phrase)}", lowered):
-                return language
-        return self._target_language_for_bilingual_pair(line, source_language=source_language)
+        return target_language_from_text(line, source_language=source_language)
 
     def _source_language_from_text(self, line: str) -> str | None:
-        lowered = line.casefold()
-        explicit = re.search(r"(?:source(?: language)?|源语言)\s*[:=：]\s*([a-zA-Z][a-zA-Z_-]*)", line)
-        if explicit is not None:
-            return explicit.group(1)
-        if any(word in lowered for word in ("中文字幕", "中文源字幕", "中文原字幕", "原文中文")):
-            return "Chinese"
-        if any(word in lowered for word in ("英文字幕", "英语字幕", "英文源字幕", "英文原字幕", "原文英文", "原文英语")):
-            return "English"
-        for phrase, language in _language_phrases():
-            if re.search(rf"(?:从|from\s+)\s*{re.escape(phrase)}", lowered):
-                return language
-        return None
+        return source_language_from_text(line)
 
     def _target_language_for_bilingual_pair(
         self,
@@ -2071,32 +1649,13 @@ class SubBakeAgent:
         *,
         source_language: str | None,
     ) -> str | None:
-        lowered = line.casefold()
-        if any(word in lowered for word in ("中英", "中文英文", "chinese english", "chinese-english")):
-            if source_language == "Chinese":
-                return "English"
-            if source_language == "English":
-                return "Chinese"
-        if any(word in lowered for word in ("英中", "英文中文", "english chinese", "english-chinese")):
-            if source_language == "English":
-                return "Chinese"
-            if source_language == "Chinese":
-                return "English"
-        return None
+        return target_language_for_bilingual_pair(line, source_language=source_language)
 
     def _output_format_from_text(self, line: str) -> str | None:
-        lowered = line.casefold()
-        for pattern in _output_format_patterns():
-            match = re.search(pattern, lowered)
-            if match is not None:
-                return match.group(1)
-        return None
+        return output_format_from_text(line)
 
     def _line_without_output_format_phrases(self, line: str) -> str:
-        cleaned = line.casefold()
-        for pattern in _output_format_patterns():
-            cleaned = re.sub(pattern, " ", cleaned)
-        return cleaned
+        return line_without_output_format_phrases(line)
 
     def _print_translation_start(
         self,
@@ -2108,46 +1667,23 @@ class SubBakeAgent:
         series: bool,
         path: Path | None = None,
     ) -> None:
-        action = "规划" if bool(values["dry_run"]) else "翻译"
-        subject = path.name if path is not None else self._file_count_label(file_count, suffixes)
-        render_label = self._render_mode_label(original, values)
-        scope = "同一系列" if series else "这个文件"
-        self.console.print(f"[bold green]Preparing:[/bold green] 现在要按{scope}{action} {subject}，{render_label}。")
-
-    def _print_file_completion(self, *, output_path: Path | None, dry_run: bool) -> None:
-        if dry_run:
-            self.console.print("[bold green]Completed:[/bold green] 已完成翻译规划。")
-            return
-        self.console.print(f"[bold green]Completed:[/bold green] 已完成翻译，输出 {output_path}。")
-
-    def _print_series_completion(self, result) -> None:
-        if result.failure_count:
-            self.console.print(
-                "[bold yellow]Completed:[/bold yellow] "
-                f"已完成 {result.processed_count} 个，跳过 {result.skipped_count} 个，失败 {result.failure_count} 个。"
-            )
-            return
-        self.console.print(
-            "[bold green]Completed:[/bold green] "
-            f"已完成 {result.processed_count} 个文件翻译，跳过 {result.skipped_count} 个。"
+        print_translation_start(
+            self.console, values=values, file_count=file_count,
+            suffixes=suffixes, series=series, path=path, original=original,
         )
 
+    def _print_file_completion(self, *, output_path: Path | None, dry_run: bool) -> None:
+        print_file_completion(self.console, output_path=output_path, dry_run=dry_run)
+
+    def _print_series_completion(self, result) -> None:
+        print_series_completion(self.console, result)
+
     def _file_count_label(self, file_count: int, suffixes: set[str]) -> str:
-        suffix_label = ", ".join(sorted(suffixes))
-        if suffix_label:
-            return f"{file_count} 个 {suffix_label} 文件"
-        return f"{file_count} 个字幕文件"
+        from .ui import _file_count_label
+        return _file_count_label(file_count, suffixes)
 
     def _render_mode_label(self, original: str, values: dict[str, Any]) -> str:
-        if bool(values["bilingual"]):
-            base_label = "生成中英双语字幕" if "中英" in original else "生成双语字幕"
-            label = f"{base_label}，目标语言 {values['target_language']}"
-        else:
-            label = f"目标语言 {values['target_language']}"
-        output_format = values.get("output_format")
-        if output_format is not None:
-            label = f"{label}，输出 {str(output_format).upper()} 格式"
-        return label
+        return render_mode_label(original, values)
 
     def _store_plan(self, decision: dict[str, Any], *, original: str) -> None:
         tool_calls = [
@@ -2174,60 +1710,19 @@ class SubBakeAgent:
         self._record_event("plan", original, {"tool_calls": tool_calls})
 
     def _print_tool_call_preview(self, call: dict[str, Any]) -> None:
-        tool_name = str(call.get("tool_name") or "unknown")
-        arguments = dict(call.get("arguments") or {})
-
-        self.console.print(f"[bold]{tool_name}[/bold]")
-
-        path = str(arguments.get("path") or arguments.get("old_path") or "")
-        if path:
-            self.console.print(f"  path: {path}")
-        new_path = str(arguments.get("new_path") or "")
-        if new_path:
-            self.console.print(f"  → {new_path}")
-
-        if tool_name in {"create_file", "append_file"}:
-            self._print_content_preview(str(arguments.get("content") or ""))
-        elif tool_name == "replace_in_file":
-            self._print_replace_preview(
-                str(arguments.get("old") or ""),
-                str(arguments.get("new") or ""),
-            )
-        elif tool_name == "edit_subtitle":
-            instruction = str(arguments.get("instruction") or "")
-            if instruction:
-                self.console.print(f"  instruction: {instruction}")
-        elif tool_name == "translate_file":
-            self._print_translation_options(arguments)
-        elif tool_name == "translate_series":
-            self._print_translation_options(arguments)
+        print_tool_call_preview(self.console, call)
 
     def _print_content_preview(self, content: str) -> None:
-        if not content:
-            self.console.print("  [dim](empty content)[/dim]")
-            return
-        preview = content if len(content) <= 300 else f"{content[:300]}..."
-        self.console.print(f"  content ({len(content)} chars):")
-        for line in preview.splitlines()[:12]:
-            self.console.print(f"  │ {line}")
-        if len(content) > 300 or len(preview.splitlines()) > 12:
-            self.console.print("  │ [dim]...[/dim]")
+        from .ui import _print_content_preview
+        _print_content_preview(self.console, content)
 
     def _print_replace_preview(self, old: str, new: str) -> None:
-        old_preview = old if len(old) <= 120 else f"{old[:120]}..."
-        new_preview = new if len(new) <= 120 else f"{new[:120]}..."
-        self.console.print(f"  old: {old_preview}")
-        self.console.print(f"  new: {new_preview}")
+        from .ui import _print_replace_preview
+        _print_replace_preview(self.console, old, new)
 
     def _print_translation_options(self, arguments: dict[str, Any]) -> None:
-        for key in ("target_language", "source_language", "output_format"):
-            value = arguments.get(key)
-            if value:
-                self.console.print(f"  {key}: {value}")
-        for key in ("bilingual", "dry_run", "fast", "recursive", "overwrite"):
-            value = arguments.get(key)
-            if value:
-                self.console.print(f"  {key}: {value}")
+        from .ui import _print_translation_options
+        _print_translation_options(self.console, arguments)
 
     def _handle_plan_command(self, rest: str) -> None:
         option = rest.strip().lower()
@@ -2285,7 +1780,7 @@ class SubBakeAgent:
             series=False,
             path=path,
         )
-        backend = build_backend_from_values(values)
+        backend = _runtime_options.build_backend_from_values(values)
         options = build_pipeline_options(
             input_path=path,
             output_path=None,
@@ -2329,12 +1824,7 @@ class SubBakeAgent:
             )
 
     def _print_file_op_result(self, result: FileOpResult) -> None:
-        if result.action == "renamed" and result.new_path is not None:
-            self.console.print(f"[bold green]Renamed:[/bold green] {result.path} -> {result.new_path}")
-        else:
-            self.console.print(f"[bold green]{result.action.title()}:[/bold green] {result.path}")
-        if result.backup_path is not None:
-            self.console.print(f"[bold green]Backup:[/bold green] {result.backup_path}")
+        print_file_op_result(self.console, result)
 
     def _diagnose_path(self, path: Path, *, original: str) -> None:
         report = diagnose_path(path)
@@ -2483,7 +1973,7 @@ class SubBakeAgent:
     def _config_path_for_profile_write(self) -> Path:
         if self.config_path is not None:
             return self.config_path
-        candidates = global_config_candidates()
+        candidates = _config.global_config_candidates()
         if not candidates:
             raise RuntimeError("No global config path is available on this platform.")
         return candidates[0]
@@ -2637,39 +2127,10 @@ class SubBakeAgent:
         self._record_event("resume", "/resume", {"session_id": latest.id})
 
     def _print_help(self) -> None:
-        self.console.print(
-            "\n".join(
-                [
-                    "Ask naturally:",
-                    "  翻译 @episode01.srt",
-                    "  把 @Season01 翻译成中文",
-                    "  分析 @.subbake/runs/.../failure.json",
-                    "  把 notes.txt 改名成 glossary-notes.txt",
-                    "  创建 @notes.txt 记录 Alice 译作爱丽丝",
-                    "",
-                    "Controls:",
-                    "  Tab                    complete slash commands & autocomplete",
-                    "  Shift+Tab               toggle plan mode",
-                    "  /model or /profile      choose a model profile",
-                    "  /model <profile>        switch profile directly",
-                    "  /session                choose a previous session",
-                    "  /plan                   enter plan mode",
-                    "  /plan off               return to chat mode",
-                    "  /approve                execute the pending plan",
-                    "  /reject                 discard the pending plan",
-                    "  /clear                  start a new agent session",
-                    "  /sessions               list recent sessions",
-                    "  /resume                 resume the latest session",
-                    "  /exit                   quit",
-                ]
-            )
-        )
+        _print_help_fn(self.console)
 
     def _print_series_summary(self, result) -> None:
-        self.console.print(
-            "[bold green]Series result:[/bold green] "
-            f"{result.processed_count} processed, {result.skipped_count} skipped, {result.failure_count} failed"
-        )
+        print_series_summary(self.console, result)
         for item in result.skipped[:5]:
             self.console.print(f"  skipped {item.input_path}: {item.reason}")
         for item in result.failures[:5]:
@@ -2874,560 +2335,6 @@ class SubBakeAgent:
         return command.lower(), rest
 
 
-class _AgentLoopTrace:
-    TRACE_STYLES = {
-        "THINK": "dim",
-        "TOOL": "bold yellow",
-        "OBSERVE": "green",
-        "EXECUTE": "bold green",
-        "PLAN": "bold cyan",
-        "FINAL": "bold green",
-    }
-
-    def __init__(self, *, console: Console, interactive: bool) -> None:
-        self.console = console
-        self.interactive = interactive
-        self.started = False
-
-    def start(self) -> None:
-        if self.started:
-            return
-        self.started = True
-        if self.interactive:
-            header = Text()
-            header.append("Agent Loop", style="bold cyan")
-            header.append("  bounded discovery", style="dim")
-            self.console.print(header)
-            return
-        self.console.print("Agent Loop")
-
-    @contextmanager
-    def thinking(self) -> Iterator[None]:
-        if self.interactive:
-            with self.console.status("THINK model deciding", spinner="dots"):
-                yield
-            self.think()
-            return
-        self.think()
-        yield
-
-    def think(self) -> None:
-        self._emit("THINK model deciding")
-
-    def tool(self, tool_name: str, arguments: dict[str, Any]) -> None:
-        suffix = _trace_arguments(arguments)
-        self._emit(f"TOOL {tool_name}{suffix}")
-
-    def observe(self, preview: str) -> None:
-        self._emit(f"OBSERVE {preview}")
-
-    def final(self, decision: dict[str, Any]) -> None:
-        action = str(decision.get("action") or "")
-        if action == "tool_call":
-            tool_name = str(decision.get("tool_name") or "")
-            suffix = _trace_arguments(dict(decision.get("arguments") or {}), include_modes=True)
-            self._emit(f"EXECUTE {tool_name}{suffix}")
-            return
-        if action == "plan":
-            tool_calls = [call for call in decision.get("tool_calls") or [] if isinstance(call, dict)]
-            if tool_calls:
-                first = tool_calls[0]
-                tool_name = str(first.get("tool_name") or "")
-                suffix = _trace_arguments(dict(first.get("arguments") or {}), include_modes=True)
-                self._emit(f"PLAN {tool_name}{suffix}")
-                return
-        self._emit(f"FINAL {action or 'respond'}")
-
-    def _emit(self, line: str) -> None:
-        if not self.interactive:
-            self.console.print(line)
-            return
-
-        label, _, detail = line.partition(" ")
-        row = Text("  ")
-        row.append("| ", style="dim")
-        row.append(label, style=self.TRACE_STYLES.get(label, "bold"))
-        if detail:
-            row.append(" ")
-            row.append(detail)
-        self.console.print(row)
-
-
-def _trace_arguments(arguments: dict[str, Any], *, include_modes: bool = False) -> str:
-    parts: list[str] = []
-    for key in ("path", "old_path", "new_path", "query", "pattern"):
-        value = arguments.get(key)
-        if value is None or value == "":
-            continue
-        parts.append(_trace_value(str(value)))
-    if include_modes:
-        if arguments.get("bilingual") is True:
-            parts.append("bilingual")
-        output_format = arguments.get("output_format")
-        if output_format:
-            parts.append(f"output={output_format}")
-    return "" if not parts else " " + " ".join(parts)
-
-
-def _trace_value(value: str) -> str:
-    if re.search(r"\s", value):
-        return json.dumps(value, ensure_ascii=False)
-    return value
-
-
 def start_interactive_agent(*, console: Console, resume: bool = False) -> None:
     SubBakeAgent(console=console, resume=resume).run()
 
-
-def _prompt_toolkit_prompt():
-    try:
-        from prompt_toolkit import prompt
-    except Exception:
-        return None
-
-    def _run(prompt_text: str, *, completer=None, key_bindings=None) -> str:
-        return prompt(
-            prompt_text,
-            completer=completer,
-            complete_while_typing=True,
-            key_bindings=key_bindings,
-        )
-
-    return _run
-
-
-def _slash_command_completer():
-    try:
-        from prompt_toolkit.completion import Completer, Completion
-    except Exception:
-        return None
-
-    class SlashCommandCompleter(Completer):
-        def get_completions(self, document, complete_event):
-            text = document.text_before_cursor
-            if not text.startswith("/"):
-                return
-            query = text.casefold()
-            for command, meta in AGENT_COMMANDS:
-                if command.casefold().startswith(query):
-                    yield Completion(
-                        command,
-                        start_position=-len(text),
-                        display=command,
-                        display_meta=meta,
-                    )
-
-    return SlashCommandCompleter()
-
-
-def _slash_command_matches(query: str) -> list[str]:
-    normalized = query.casefold()
-    return [
-        command
-        for command, _ in AGENT_COMMANDS
-        if command.casefold().startswith(normalized)
-    ]
-
-
-def _unique_slash_command_match(query: str) -> str | None:
-    matches = _slash_command_matches(query)
-    if len(matches) == 1:
-        return matches[0]
-    return None
-
-
-def _prompt_toolkit_inline_picker(title: str, options: list[tuple[str, str]], *, default: str) -> str | None:
-    try:
-        from prompt_toolkit import prompt
-        from prompt_toolkit.application.current import get_app
-        from prompt_toolkit.completion import Completer, Completion
-        from prompt_toolkit.filters import has_completions
-        from prompt_toolkit.key_binding import KeyBindings
-        from prompt_toolkit.shortcuts import CompleteStyle
-        from prompt_toolkit.styles import Style
-    except Exception:
-        return None
-
-    choices = _picker_choices(options, default=default)
-
-    class InlinePickerCompleter(Completer):
-        def get_completions(self, document, complete_event):
-            for choice in _matching_picker_choices(document.text_before_cursor, choices):
-                yield Completion(
-                    choice.completion_text,
-                    start_position=-len(document.text_before_cursor),
-                    display=choice.display,
-                    display_meta=choice.meta,
-                )
-
-    key_bindings = KeyBindings()
-
-    @key_bindings.add("down", filter=has_completions)
-    def _next_completion(event) -> None:
-        event.current_buffer.complete_next()
-
-    @key_bindings.add("up", filter=has_completions)
-    def _previous_completion(event) -> None:
-        event.current_buffer.complete_previous()
-
-    @key_bindings.add("tab")
-    def _complete_or_accept(event) -> None:
-        buffer = event.current_buffer
-        completion = _current_completion(buffer)
-        if completion is not None:
-            buffer.apply_completion(completion)
-            return
-        buffer.start_completion(select_first=True)
-
-    @key_bindings.add("enter")
-    def _accept(event) -> None:
-        buffer = event.current_buffer
-        completion = _current_completion(buffer)
-        if completion is not None:
-            buffer.apply_completion(completion)
-        event.app.exit(result=buffer.text)
-
-    @key_bindings.add("escape")
-    @key_bindings.add("c-c")
-    def _cancel(event) -> None:
-        event.app.exit(result=PICKER_CANCEL_TOKEN)
-
-    style = Style.from_dict(
-        {
-            "completion-menu.completion": "",
-            "completion-menu.completion.current": "reverse bold",
-            "completion-menu.meta.completion": "fg:ansibrightblack",
-            "completion-menu.meta.completion.current": "reverse bold",
-            "bottom-toolbar": "reverse",
-        }
-    )
-
-    try:
-        raw_selection = prompt(
-            _picker_prompt(title),
-            completer=InlinePickerCompleter(),
-            complete_while_typing=True,
-            complete_style=CompleteStyle.COLUMN,
-            key_bindings=key_bindings,
-            reserve_space_for_menu=8,
-            bottom_toolbar=_picker_toolbar(title),
-            style=style,
-            pre_run=lambda: get_app().current_buffer.start_completion(select_first=True),
-        )
-    except KeyboardInterrupt:
-        return PICKER_CANCEL_TOKEN
-    if raw_selection == PICKER_CANCEL_TOKEN:
-        return PICKER_CANCEL_TOKEN
-    return _resolve_picker_selection(raw_selection, choices, default=default) or PICKER_CANCEL_TOKEN
-
-
-def _current_completion(buffer):
-    complete_state = buffer.complete_state
-    if complete_state is None:
-        return None
-    return complete_state.current_completion
-
-
-def _picker_choices(options: list[tuple[str, str]], *, default: str) -> list[PickerChoice]:
-    choices = [_picker_choice(value, label) for value, label in options]
-    default_index = next((index for index, choice in enumerate(choices) if choice.value == default), None)
-    if default_index is None:
-        return choices
-    return [choices[default_index], *choices[:default_index], *choices[default_index + 1 :]]
-
-
-def _matching_picker_choices(query: str, choices: list[PickerChoice]) -> list[PickerChoice]:
-    normalized = query.strip().casefold()
-    if not normalized:
-        return choices
-    return [choice for choice in choices if normalized in choice.search_text]
-
-
-def _picker_choice(value: str, label: str) -> PickerChoice:
-    display, meta = _picker_display_parts(label)
-    completion_text = label if value.startswith("__subbake_") else value
-    search_text = f"{value} {label} {display} {meta}".casefold()
-    return PickerChoice(
-        value=value,
-        label=label,
-        completion_text=completion_text,
-        display=display,
-        meta=meta,
-        search_text=search_text,
-    )
-
-
-def _picker_display_parts(label: str) -> tuple[str, str]:
-    if "  (" in label and label.endswith(")"):
-        display, _, meta = label.rpartition("  ")
-        return display, meta
-    if ": " in label:
-        display, meta = label.split(": ", 1)
-        return display, meta
-    return label, ""
-
-
-def _resolve_picker_selection(raw_selection: str, choices: list[PickerChoice], *, default: str) -> str | None:
-    selection = raw_selection.strip()
-    if not selection:
-        return default
-    normalized = selection.casefold()
-    for choice in choices:
-        if normalized in {
-            choice.value.casefold(),
-            choice.label.casefold(),
-            choice.completion_text.casefold(),
-        }:
-            return choice.value
-    matches = [choice for choice in choices if normalized in choice.search_text]
-    if len(matches) == 1:
-        return matches[0].value
-    return None
-
-
-def _picker_prompt(title: str) -> str:
-    lowered = title.casefold()
-    if "session" in lowered:
-        return "session> "
-    if "profile" in lowered or "model" in lowered:
-        return "profile> "
-    if "config" in lowered:
-        return "config> "
-    return "choose> "
-
-
-def _picker_toolbar(title: str) -> str:
-    return f" {title}: type to filter, Tab/Enter to select, Esc to cancel "
-
-
-def _prompt_toolkit_inline_text(
-    title: str,
-    text: str,
-    *,
-    default: str,
-    completions: tuple[str, ...],
-) -> str | None:
-    try:
-        from prompt_toolkit import prompt
-        from prompt_toolkit.completion import Completer, Completion
-        from prompt_toolkit.filters import has_completions
-        from prompt_toolkit.key_binding import KeyBindings
-        from prompt_toolkit.shortcuts import CompleteStyle
-        from prompt_toolkit.styles import Style
-    except Exception:
-        return None
-
-    class InlineTextCompleter(Completer):
-        def get_completions(self, document, complete_event):
-            query = document.text_before_cursor.strip()
-            for value in _text_prompt_matches(query, completions):
-                yield Completion(
-                    value,
-                    start_position=-len(document.text_before_cursor),
-                )
-
-    key_bindings = KeyBindings()
-
-    @key_bindings.add("down", filter=has_completions)
-    def _next_completion(event) -> None:
-        event.current_buffer.complete_next()
-
-    @key_bindings.add("up", filter=has_completions)
-    def _previous_completion(event) -> None:
-        event.current_buffer.complete_previous()
-
-    @key_bindings.add("tab")
-    def _complete(event) -> None:
-        buffer = event.current_buffer
-        query = buffer.document.text_before_cursor
-        matches = _text_prompt_matches(query, completions)
-        if len(matches) == 1:
-            buffer.delete_before_cursor(len(query))
-            buffer.insert_text(matches[0])
-            return
-        completion = _current_completion(buffer)
-        if completion is not None:
-            buffer.apply_completion(completion)
-            return
-        buffer.start_completion(select_first=True)
-
-    @key_bindings.add("enter")
-    def _accept(event) -> None:
-        buffer = event.current_buffer
-        completion = _current_completion(buffer)
-        if completion is not None:
-            buffer.apply_completion(completion)
-        event.app.exit(result=buffer.text)
-
-    @key_bindings.add("escape")
-    @key_bindings.add("c-c")
-    def _cancel(event) -> None:
-        event.app.exit(result=PICKER_CANCEL_TOKEN)
-
-    style = Style.from_dict(
-        {
-            "completion-menu.completion": "",
-            "completion-menu.completion.current": "reverse bold",
-            "bottom-toolbar": "reverse",
-        }
-    )
-
-    try:
-        raw_value = prompt(
-            _text_prompt(text),
-            completer=InlineTextCompleter() if completions else None,
-            complete_while_typing=True,
-            complete_style=CompleteStyle.COLUMN,
-            key_bindings=key_bindings,
-            reserve_space_for_menu=6,
-            bottom_toolbar=_text_prompt_toolbar(title, text, default),
-            style=style,
-        )
-    except KeyboardInterrupt:
-        return PICKER_CANCEL_TOKEN
-    if raw_value == PICKER_CANCEL_TOKEN:
-        return PICKER_CANCEL_TOKEN
-    return _resolve_text_prompt_value(raw_value, default=default)
-
-
-def _text_prompt_matches(query: str, completions: tuple[str, ...]) -> list[str]:
-    normalized = query.strip().casefold()
-    if not completions:
-        return []
-    if not normalized:
-        return list(completions)
-    return [value for value in completions if value.casefold().startswith(normalized)]
-
-
-def _language_phrases() -> tuple[tuple[str, str], ...]:
-    return (
-        ("简体中文", "Chinese"),
-        ("中文", "Chinese"),
-        ("汉语", "Chinese"),
-        ("chinese", "Chinese"),
-        ("zh-cn", "Chinese"),
-        ("zh", "Chinese"),
-        ("繁体中文", "Traditional Chinese"),
-        ("traditional chinese", "Traditional Chinese"),
-        ("英文", "English"),
-        ("英语", "English"),
-        ("english", "English"),
-        ("en", "English"),
-        ("日文", "Japanese"),
-        ("日语", "Japanese"),
-        ("japanese", "Japanese"),
-        ("ja", "Japanese"),
-        ("韩文", "Korean"),
-        ("韩语", "Korean"),
-        ("korean", "Korean"),
-        ("ko", "Korean"),
-        ("法文", "French"),
-        ("法语", "French"),
-        ("french", "French"),
-        ("fr", "French"),
-        ("德文", "German"),
-        ("德语", "German"),
-        ("german", "German"),
-        ("de", "German"),
-        ("西班牙文", "Spanish"),
-        ("西班牙语", "Spanish"),
-        ("spanish", "Spanish"),
-        ("es", "Spanish"),
-        ("葡萄牙文", "Portuguese"),
-        ("葡萄牙语", "Portuguese"),
-        ("portuguese", "Portuguese"),
-        ("pt", "Portuguese"),
-        ("俄文", "Russian"),
-        ("俄语", "Russian"),
-        ("russian", "Russian"),
-        ("ru", "Russian"),
-        ("意大利文", "Italian"),
-        ("意大利语", "Italian"),
-        ("italian", "Italian"),
-        ("it", "Italian"),
-    )
-
-
-def _output_format_patterns() -> tuple[str, ...]:
-    return (
-        r"(?:输出|生成|保存|导出|产出).{0,12}\.?(srt|vtt|txt)(?:\s*格式|\s*文件|\s*字幕)?",
-        r"\.?(srt|vtt|txt).{0,8}(?:格式|输出)",
-        r"(?:output|export|save).{0,12}\.?(srt|vtt|txt)\b",
-    )
-
-
-def _resolve_text_prompt_value(raw_value: str, *, default: str) -> str:
-    if raw_value == "":
-        return default
-    return raw_value
-
-
-def _default_api_key_env(provider: str) -> str:
-    normalized = provider.strip().casefold()
-    if normalized in {"openai", "openai-compatible", "compatible"}:
-        return "OPENAI_API_KEY"
-    if normalized == "anthropic":
-        return "ANTHROPIC_API_KEY"
-    if normalized == "gemini":
-        return "GEMINI_API_KEY"
-    return ""
-
-
-def _text_prompt(text: str) -> str:
-    normalized = re.sub(r"\s+", " ", text.strip().casefold())
-    labels = {
-        "profile name": "profile name",
-        "provider": "provider",
-        "model": "model",
-        "api key environment variable": "api key env",
-        "base url": "base url",
-        "target language": "target language",
-    }
-    return f"{labels.get(normalized, normalized or 'value')}> "
-
-
-def _text_prompt_toolbar(title: str, text: str, default: str) -> str:
-    default_text = f", default: {default}" if default else ""
-    return f" {title} / {text}{default_text}: Enter accepts, Tab completes, Esc cancels "
-
-
-def _toml_key(value: str) -> str:
-    if re.match(r"^[A-Za-z0-9_-]+$", value):
-        return value
-    return json.dumps(value, ensure_ascii=False)
-
-
-def _toml_string(value: str) -> str:
-    return json.dumps(value, ensure_ascii=False)
-
-
-def _prepend_default_profile(content: str, profile_name: str) -> str:
-    default_line = f"default_profile = {_toml_string(profile_name)}\n"
-    if not content:
-        return default_line
-    return f"{default_line}\n{content}"
-
-
-def _short_title(value: str, *, limit: int = 72) -> str:
-    title = " ".join(value.strip().split())
-    if len(title) <= limit:
-        return title
-    return f"{title[: limit - 3]}..."
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _verify_write_text(path: Path, expected: str) -> None:
-    """Read back a just-written file and verify its content matches exactly."""
-    try:
-        actual = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise OSError(f"Write verification failed: cannot read back {path}: {exc}") from exc
-    if actual != expected:
-        raise OSError(
-            f"Write verification failed for {path}: "
-            f"content mismatch (expected {len(expected)} bytes, "
-            f"got {len(actual)} bytes)"
-        )

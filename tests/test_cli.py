@@ -16,10 +16,12 @@ from typer.testing import CliRunner
 
 from subbake import __version__
 from subbake.agent import (
-    AGENT_COMMANDS,
     CONFIG_BOOTSTRAP_CREATE,
     NEW_PROFILE_VALUE,
     SubBakeAgent,
+)
+from subbake.agent.trace import (
+    AGENT_COMMANDS,
     _AgentLoopTrace,
     _default_api_key_env,
     _matching_picker_choices,
@@ -328,8 +330,8 @@ class CLITestCase(unittest.TestCase):
     def test_agent_offers_config_bootstrap_when_interactive_without_config(self) -> None:
         with self._isolated_filesystem():
             with (
-                patch("subbake.agent.discover_config_path", return_value=None),
-                patch("subbake.agent.discover_project_config_path", return_value=None),
+                patch("subbake.config.discover_config_path", return_value=None),
+                patch("subbake.config.discover_project_config_path", return_value=None),
             ):
                 agent = SubBakeAgent(console=Console(record=True), resume=False)
 
@@ -347,9 +349,9 @@ class CLITestCase(unittest.TestCase):
         with self._isolated_filesystem():
             config_path = Path("xdg/subbake/config.toml")
             with (
-                patch("subbake.agent.discover_config_path", return_value=None),
-                patch("subbake.agent.discover_project_config_path", return_value=None),
-                patch("subbake.agent.global_config_candidates", return_value=[config_path]),
+                patch("subbake.config.discover_config_path", return_value=None),
+                patch("subbake.config.discover_project_config_path", return_value=None),
+                patch("subbake.config.global_config_candidates", return_value=[config_path]),
             ):
                 agent = SubBakeAgent(console=Console(record=True), resume=False)
                 agent.interactive = True
@@ -405,9 +407,9 @@ class CLITestCase(unittest.TestCase):
         with self._isolated_filesystem():
             config_path = Path("xdg/subbake/config.toml")
             with (
-                patch("subbake.agent.discover_config_path", return_value=None),
-                patch("subbake.agent.discover_project_config_path", return_value=None),
-                patch("subbake.agent.global_config_candidates", return_value=[config_path]),
+                patch("subbake.config.discover_config_path", return_value=None),
+                patch("subbake.config.discover_project_config_path", return_value=None),
+                patch("subbake.config.global_config_candidates", return_value=[config_path]),
             ):
                 agent = SubBakeAgent(console=Console(record=True), resume=False)
                 agent.interactive = True
@@ -1033,7 +1035,7 @@ class CLITestCase(unittest.TestCase):
         with self._isolated_filesystem():
             Path("visible.txt").write_text("hello\n", encoding="utf-8")
 
-            with patch("subbake.agent.build_backend_from_values", return_value=LoopingAgentBackend()):
+            with patch("subbake.runtime_options.build_backend_from_values", return_value=LoopingAgentBackend()):
                 result = self.runner.invoke(app, [], input="请先想一想怎么处理\n/exit\n")
             output = self._strip_ansi(result.stdout)
 

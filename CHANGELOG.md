@@ -4,24 +4,37 @@ This file tracks notable changes for each release.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-06-07
+
 ### Added
 
-- Agent now pre-classifies user intents before entering the full agent loop. High-confidence intents (translation, series, editing, diagnosis, file operations, browsing, profile switching) can go directly to tool execution, and the agent loop only loads tools relevant to the detected category, improving both speed and focus.
-- A mock intent classifier for the mock backend supports keyword-based classification, enabling offline testing of the intent gate.
-- An intent-confidence gating system routes low-confidence requests to clarification prompts and medium-confidence requests to user confirmation, preventing premature or incorrect tool calls.
-- Agent observations now carry a `context_summary` field, with per-tool-type summarization (`list_files` counts by kind, `search_files` shows top candidates, `candidate_subtitles` lists matches, `recent_translations` reports the latest record, `read_file_preview` includes char count).
-- The agent loop context includes `pre_populated_arguments` from intent parameters and uses compact `to_context_dict()` representations with summaries instead of full observation dumps.
-- Tool specifications migrated from flat arg lists to structured JSON schemas with categorized tool groups, enabling intent-based filtering of available tools in the agent loop.
-- Tests for the intent classification gate (`test_intent_gate.py`) covering mock classification across all categories, fallback classification, confidence gating at different thresholds, and required-arg validation.
-- Tests for observation summarization (`test_observation_summary.py`) covering `list_files`, `search_files`, `candidate_subtitles`, `recent_translations`, and `read_file_preview` summaries.
+- **Intent classification gate**: the agent pre-classifies user intents before entering the full agent loop. High-confidence intents (translation, series, editing, diagnosis, file operations, browsing, profile switching) go directly to tool execution, and the agent loop only loads tools relevant to the detected category, improving speed and focus.
+- **Intent-confidence gating**: low-confidence requests are routed to clarification prompts, and medium-confidence requests prompt the user for confirmation before proceeding, preventing premature or incorrect tool calls.
+- **`/undo` command**: reverts the last file operation (create, modify, append, rename, delete) by restoring from its backup. Series translation outputs are grouped so a single `/undo` removes all files produced by a batch translation run.
+- **Content write verification**: every file write operation now reads back and compares the written content to guard against silent data corruption from disk-full conditions, permission changes, or filesystem bugs. Covers session saves, config writes, subtitle edits, pipeline output, and storage operations.
+- **Plan preview**: when a plan is pending, the agent now shows a preview of the queued tool calls so users can see what will be executed before approving.
+- **Observation summaries**: agent observations carry a `context_summary` field with per-tool-type summarization (`list_files` counts by kind, `search_files` shows top candidates, `candidate_subtitles` lists matches, `recent_translations` reports the latest record, `read_file_preview` includes char count).
+- **Structured tool specs**: tools use JSON Schema definitions organized into categorized groups (translate_file, translate_series, edit_subtitle, diagnose, file_operation, browse, profile, chat), enabling intent-based filtering of available tools.
+- **Intent hint propagation**: the agent loop state now carries an `intent_hint` with category, confidence, and reasoning, so the agent loop model trusts the pre-classified intent instead of re-deriving it from scratch.
+- **Mock intent classifier**: the mock backend supports keyword-based classification, enabling offline testing of the intent gate.
+- Tests for the intent classification gate (`test_intent_gate.py`) covering all categories, fallback classification, confidence gating, and required-arg validation.
+- Tests for observation summarization (`test_observation_summary.py`) covering all summarizer types.
+- CLI integration tests for `/undo` covering single-file removal, overwrite restoration, and grouped series-output undo.
 
 ### Changed
 
 - `.gitignore` now excludes `CLAUDE.md` from version control.
+- The `read_file` tool moved from the `file_operation` category to `browse`, since it is a non-mutating operation.
+- Agent loop context uses compact `to_context_dict()` representations with summaries instead of full observation dumps, reducing prompt bloat.
 
 ### Fixed
 
+- Removed redundant right-arrow keybinding for slash-command completion; Tab is the canonical completion key.
 - The original `_run_agent_loop` signature is preserved with an optional `state` parameter, keeping backward compatibility for existing callers.
+
+### Removed
+
+- Dead code: `_decide_next_action` and `_build_agent_decision_messages` methods removed from the agent (replaced by the intent gate + agent loop flow).
 
 ## [0.4.1] - 2026-06-03
 
