@@ -748,6 +748,11 @@ class SubBakeAgent:
             current_mode=self.session.mode,
             allowed_tools=tuple(sorted(allowed_tools)),
             pre_populated_arguments=pre_args,
+            intent_hint={
+                "category": category,
+                "confidence": intent_confidence,
+                "reason": reason,
+            },
         )
         return self._run_agent_loop(line, state=state)
 
@@ -915,6 +920,8 @@ class SubBakeAgent:
             "Never claim a file exists unless it is present in references or tool observations.\n"
             "If multiple strong subtitle candidates remain, return ask_user with the choices.\n"
             "In plan mode, discovery tools may run; executable final actions will be stored for approval.\n"
+            "When the context includes an intent_hint, trust its category and reason "
+            "unless observations contradict it — do not re-derive the user's intent from scratch.\n"
         )
         user_prompt = (
             "TASK_START\n"

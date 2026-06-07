@@ -99,6 +99,7 @@ class AgentLoopState:
     steps: list[AgentLoopStep] = field(default_factory=list)
     observations: list[AgentObservation] = field(default_factory=list)
     pre_populated_arguments: dict[str, Any] = field(default_factory=dict)
+    intent_hint: dict[str, Any] | None = None
 
     def to_context(self) -> dict[str, Any]:
         base = {
@@ -113,6 +114,8 @@ class AgentLoopState:
             base["observations"] = [o.to_context_dict() for o in self.observations]
         if self.pre_populated_arguments:
             base["pre_populated_arguments"] = self.pre_populated_arguments
+        if self.intent_hint:
+            base["intent_hint"] = self.intent_hint
         return base
 
 
