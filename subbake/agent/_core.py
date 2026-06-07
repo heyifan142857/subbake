@@ -272,7 +272,11 @@ class SubBakeAgent:
 
         messages = self._build_chat_messages(line)
         try:
-            payload, _ = backend.generate_json(messages)
+            if self.interactive:
+                with self.console.status("thinking", spinner="dots"):
+                    payload, _ = backend.generate_json(messages)
+            else:
+                payload, _ = backend.generate_json(messages)
             response = str(payload.get("message", "") or "").strip()
             if not response:
                 response = "How can I help with your subtitles?"
