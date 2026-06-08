@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 from subbake.models.base_model import MockBackend
 from subbake import runtime_options as _runtime_options
+from subbake.cancellation import OperationCancelledError
 from .loop import AgentLoopState
 from .text_helpers import extract_references
 from .tool_registry import ALWAYS_AVAILABLE_TOOLS, TOOL_CATEGORIES
@@ -67,7 +68,9 @@ def classify_intent(
         {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
     ]
     try:
-        payload, _ = backend.generate_json(messages)
+        payload, _ = agent._generate_json(backend, messages)
+    except OperationCancelledError:
+        raise
     except Exception:
         return None
 

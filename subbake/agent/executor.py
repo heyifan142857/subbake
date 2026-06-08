@@ -58,6 +58,7 @@ def translate_file(
         backend=backend,
         options=options,
         dashboard=Dashboard(console=agent.console),
+        cancel_requested=_agent_cancel_requested(agent),
     )
     existed_before, backup_path = (
         _translation_output_undo_snapshot(agent, pipeline.output_path)
@@ -83,6 +84,13 @@ def translate_file(
             "source_language": str(values["source_language"]),
             "target_language": str(values["target_language"]),
             "output_format": values.get("output_format"),
+            "dry_run": bool(values["dry_run"]),
+            "summary": _translate_file_summary(path, result, values),
+            "batches_translated": result.batches_translated,
+            "input_tokens": result.usage.input_tokens,
+            "output_tokens": result.usage.output_tokens,
+            "total_tokens": result.usage.total_tokens,
+            "fast": bool(values.get("fast", False)),
         },
     )
     if result.output_path is not None and not result.dry_run:
@@ -156,6 +164,7 @@ def translate_series_tool(
         recursive=recursive,
         overwrite=overwrite,
         suffixes=suffixes,
+        cancel_requested=_agent_cancel_requested(agent),
     )
     agent._print_series_summary(result)
     agent._print_series_completion(result)
@@ -173,6 +182,7 @@ def translate_series_tool(
             "source_language": str(values["source_language"]),
             "target_language": str(values["target_language"]),
             "output_format": values.get("output_format"),
+            "summary": _series_summary(result, values),
         },
     )
     operation_group_id = uuid.uuid4().hex
@@ -215,6 +225,7 @@ def edit_generated_subtitle(
         backend=backend,
         values=values,
         project_root=agent.project_root,
+        cancel_requested=_agent_cancel_requested(agent),
     )
     agent.console.print(f"[bold green]Edited:[/bold green] {result.target_path}")
     agent.console.print(f"[bold green]Backup:[/bold green] {result.backup_path}")
@@ -230,8 +241,22 @@ def edit_generated_subtitle(
         {
             "target_path": str(result.target_path),
             "backup_path": str(result.backup_path),
+            "instruction": instruction,
+            "summary": f"编辑了 {result.target_path.name}：{_short_instruction(instruction)}",
         },
     )
+
+
+def _short_instruction(text: str, *, limit: int = 60) -> str:
+    """Truncate an edit instruction for display in a summary."""
+    cleaned = text.strip().replace("\n", " ")
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[:limit - 3]}..."
+
+
+def _agent_cancel_requested(agent: SubBakeAgent):
+    return getattr(agent, "_cancel_requested", None)
 
 
 # ---- helpers shared between translate_file and translate_series_tool --------
@@ -289,3 +314,34 @@ def _record_translation_output_file_operation(
     if group_id is not None:
         data["group_id"] = group_id
     agent._record_event("file_operation", original, data)
+
+
+def _translate_file_summary(path: Path, result, values: dict[str, Any]) -> str:
+    """Build a human-readable summary string for a file translation event."""
+    if bool(values["dry_run"]):
+        return f"规划了 {path.name}（{values['target_language']}，{result.batches_translated} 批次）"
+    output_name = result.output_path.name if result.output_path else path.name
+    tokens_str = _format_tokens(result.usage.total_tokens)
+    return (
+        f"翻译了 {path.name} → {output_name}"
+        f"（{values['target_language']}，{result.batches_translated} 批次，{tokens_str}）"
+    )
+
+
+def _series_summary(result, values: dict[str, Any]) -> str:
+    """Build a human-readable summary string for a series translation event."""
+    failures_str = f"，{result.failure_count} 个失败" if result.failure_count else ""
+    skipped_str = f"，{result.skipped_count} 个跳过" if result.skipped_count else ""
+    return (
+        f"翻译了 {result.processed_count} 个文件"
+        f"（{values['target_language']}{skipped_str}{failures_str}）"
+    )
+
+
+def _format_tokens(count: int) -> str:
+    """Format a token count for display."""
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.0f}K"
+    return str(count)

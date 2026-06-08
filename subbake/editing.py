@@ -6,8 +6,10 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from subbake.checker import validate_translation_batch
+from subbake.cancellation import OperationCancelledError, run_interruptibly
 from subbake.entities import SubtitleSegment
 from subbake.models.base_model import LLMBackend, parse_translation_lines
 from subbake.parsers import load_document, render_document
@@ -38,6 +40,7 @@ def edit_generated_subtitle(
     values: dict,
     project_root: Path,
     allow_non_generated: bool = False,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> SubtitleEditResult:
     if not target_path.exists():
         raise FileNotFoundError(f"Subtitle file not found: {target_path}")
@@ -57,7 +60,11 @@ def edit_generated_subtitle(
         instruction=instruction,
         target_language=str(values["target_language"]),
     )
-    payload, _ = backend.generate_json(messages)
+    payload, _ = run_interruptibly(
+        lambda: backend.generate_json(messages),
+        cancel_requested=cancel_requested,
+    )
+    _check_cancelled(cancel_requested)
     lines = parse_translation_lines(payload.get("lines", []))
     validate_translation_batch(target_document.segments, lines)
     edited_segments = [
@@ -72,6 +79,7 @@ def edit_generated_subtitle(
         for source, line in zip(target_document.segments, lines, strict=True)
     ]
 
+    _check_cancelled(cancel_requested)
     backup_path = _backup_target(target_path, project_root=project_root)
     rendered = render_document(
         target_document,
@@ -97,6 +105,11 @@ def edit_generated_subtitle(
         edit_notes=str(payload.get("edit_notes", "")).strip(),
         translation_memory_path=translation_memory_path,
     )
+
+
+def _check_cancelled(cancel_requested: Callable[[], bool] | None) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise OperationCancelledError("Operation cancelled by user.")
 
 
 def _load_inferred_source_document(

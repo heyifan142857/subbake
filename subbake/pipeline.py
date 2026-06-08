@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 
 from subbake.checker import ValidationError, validate_full_alignment, validate_translation_batch
 from subbake.entities import (
@@ -35,6 +35,7 @@ from subbake.prompts import (
     build_translation_messages,
     select_relevant_glossary,
 )
+from subbake.cancellation import OperationCancelledError, run_interruptibly
 from subbake.storage import (
     AgentLogStore,
     BatchShardStore,
@@ -82,7 +83,13 @@ class AgentRepairOutcome:
 
 
 class SubtitlePipeline:
-    def __init__(self, backend: LLMBackend | None, options: PipelineOptions, dashboard: Dashboard | None = None) -> None:
+    def __init__(
+        self,
+        backend: LLMBackend | None,
+        options: PipelineOptions,
+        dashboard: Dashboard | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> None:
         self.backend = backend
         self.options = replace(
             options,
@@ -91,6 +98,7 @@ class SubtitlePipeline:
         )
         self.memory = ContextMemory()
         self.dashboard = dashboard or Dashboard()
+        self.cancel_requested = cancel_requested
         self.cache_hits = 0
         self.translation_memory_hits = 0
         self.resumed_translation_batches = 0
@@ -117,6 +125,18 @@ class SubtitlePipeline:
         self.output_format = self._resolve_output_format(options.input_path)
         self.output_path = self._resolve_output_path(options.input_path)
 
+    def _check_cancelled(self) -> None:
+        """Raise OperationCancelledError if the user has requested cancellation."""
+        if self.cancel_requested is not None and self.cancel_requested():
+            raise OperationCancelledError("Operation cancelled by user.")
+
+    def _generate_json(self, messages: list[dict[str, str]]) -> tuple[dict, Usage]:
+        self._check_cancelled()
+        return run_interruptibly(
+            lambda: self._require_backend().generate_json(messages),
+            cancel_requested=self.cancel_requested,
+        )
+
     def run(self) -> PipelineResult:
         input_path = self.options.input_path
         if not input_path.exists():
@@ -136,6 +156,7 @@ class SubtitlePipeline:
                 render_fingerprint=build_render_fingerprint(self.options),
             )
             self.dashboard.mark_done("LOAD_FILE")
+            self._check_cancelled()
 
             self.dashboard.mark_running("PARSE")
             document = load_document(input_path)
@@ -145,6 +166,7 @@ class SubtitlePipeline:
             else:
                 self.dashboard.set_total_steps(2 + len(translation_batches) + 2)
             self.dashboard.mark_done("PARSE")
+            self._check_cancelled()
 
             if self.options.dry_run:
                 return PipelineResult(
@@ -183,6 +205,7 @@ class SubtitlePipeline:
             self.dashboard.mark_running("VALIDATE")
             validate_full_alignment(document.segments, translated_segments)
             self.dashboard.mark_done("VALIDATE")
+            self._check_cancelled()
             self._save_run_state(
                 translation_batches_completed=len(translation_batches),
                 review_batches_completed=resume.review_batches_completed,
@@ -201,6 +224,7 @@ class SubtitlePipeline:
             else:
                 self.dashboard.mark_skipped("FINAL_REVIEW")
 
+            self._check_cancelled()
             output_segments = self._build_output_segments(document, reviewed_segments)
             self.dashboard.mark_running("WRITE_OUTPUT")
             rendered = render_document(
@@ -245,6 +269,7 @@ class SubtitlePipeline:
             translation_batches[resume.translation_batches_completed :],
             start=resume.translation_batches_completed + 1,
         ):
+            self._check_cancelled()
             label = f"TRANSLATE_BATCH {batch_index}/{total_batches}"
             self.dashboard.mark_running("TRANSLATE_BATCH", label=label)
             started_at = perf_counter()
@@ -290,6 +315,7 @@ class SubtitlePipeline:
             review_plan[resume.review_batches_completed :],
             start=resume.review_batches_completed + 1,
         ):
+            self._check_cancelled()
             label = f"FINAL_REVIEW {review_position}/{total_batches}"
             self.dashboard.mark_running("FINAL_REVIEW", label=label)
             started_at = perf_counter()
@@ -389,7 +415,7 @@ class SubtitlePipeline:
                         cached = True
                         self.cache_hits += 1
                 if payload is None:
-                    payload, usage = self._require_backend().generate_json(messages)
+                    payload, usage = self._generate_json(messages)
                 lines = parse_translation_lines(payload.get("lines", []))
                 validate_translation_batch(pending_segments, lines)
                 glossary_updates = parse_glossary_entries(payload.get("glossary_updates", []))
@@ -401,6 +427,8 @@ class SubtitlePipeline:
                 if self.options.use_cache and not cached:
                     self.cache_store.save("translate", request_hash, payload, usage)
                 return result, usage
+            except OperationCancelledError:
+                raise
             except Exception as exc:
                 last_error = exc
                 fast_mode_result = self._fast_mode_translation_result(
@@ -438,6 +466,8 @@ class SubtitlePipeline:
                             batch_segments=pending_segments,
                             batch_index=batch_index,
                         )
+                    except OperationCancelledError:
+                        raise
                     except Exception as split_exc:
                         attempt_log["split_retry"]["error"] = str(split_exc)
                         attempt_log["split_retry"]["error_meta"] = self._error_metadata(split_exc)
@@ -670,6 +700,7 @@ class SubtitlePipeline:
             batch_index=batch_index,
             record_failure=False,
         )
+        self._check_cancelled()
         right_result, right_usage = self._translate_batch_with_retry_impl(
             batch_segments=right_segments,
             batch_index=batch_index,
@@ -950,7 +981,7 @@ class SubtitlePipeline:
                         cached = True
                         self.cache_hits += 1
                 if payload is None:
-                    payload, usage = self._require_backend().generate_json(messages)
+                    payload, usage = self._generate_json(messages)
                 lines = parse_translation_lines(payload.get("lines", []))
                 validate_translation_batch(source_segments, lines)
                 result = ReviewResult(
@@ -960,6 +991,8 @@ class SubtitlePipeline:
                 if self.options.use_cache and not cached:
                     self.cache_store.save("review", request_hash, payload, usage)
                 return result, usage
+            except OperationCancelledError:
+                raise
             except Exception as exc:
                 last_error = exc
                 attempt_logs.append(
@@ -1060,7 +1093,7 @@ class SubtitlePipeline:
                         cached = True
                         self.cache_hits += 1
                 if payload is None:
-                    payload, usage = self._require_backend().generate_json(messages)
+                    payload, usage = self._generate_json(messages)
                     total_usage.add(usage)
                 lines = parse_translation_lines(payload.get("lines", []))  # type: ignore[union-attr]
                 validate_translation_batch(batch_segments, lines)
@@ -1113,6 +1146,8 @@ class SubtitlePipeline:
                     log_path=log_path,
                     translation_result=result,
                 )
+            except OperationCancelledError:
+                raise
             except Exception as exc:
                 repair_error = exc
                 agent_attempt_logs.append(
@@ -1215,7 +1250,7 @@ class SubtitlePipeline:
                         cached = True
                         self.cache_hits += 1
                 if payload is None:
-                    payload, usage = self._require_backend().generate_json(messages)
+                    payload, usage = self._generate_json(messages)
                     total_usage.add(usage)
                 lines = parse_translation_lines(payload.get("lines", []))  # type: ignore[union-attr]
                 validate_translation_batch(source_segments, lines)
@@ -1266,6 +1301,8 @@ class SubtitlePipeline:
                     log_path=log_path,
                     review_result=result,
                 )
+            except OperationCancelledError:
+                raise
             except Exception as exc:
                 repair_error = exc
                 agent_attempt_logs.append(

@@ -9,7 +9,7 @@ from rich.console import Console
 
 from subbake.entities import PipelineResult
 from subbake.models.base_model import LLMBackend
-from subbake.pipeline import SubtitlePipeline
+from subbake.pipeline import OperationCancelledError, SubtitlePipeline
 from subbake.runtime_options import build_pipeline_options
 from subbake.ui import Dashboard
 
@@ -77,6 +77,7 @@ def translate_series(
     recursive: bool = False,
     overwrite: bool = False,
     suffixes: set[str] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> SeriesResult:
     files = discover_series_files(root, recursive=recursive, suffixes=suffixes)
     result = SeriesResult(root=root, files=files)
@@ -89,6 +90,8 @@ def translate_series(
         backend = backend_factory()
 
     for input_path in files:
+        if cancel_requested is not None and cancel_requested():
+            raise OperationCancelledError("Operation cancelled by user.")
         output_path = resolve_series_output_path(
             input_path,
             output_format=shared_values.get("output_format"),
@@ -116,8 +119,11 @@ def translate_series(
                 backend=backend,
                 options=options,
                 dashboard=Dashboard(console=console),
+                cancel_requested=cancel_requested,
             )
             pipeline_result = pipeline.run()
+        except OperationCancelledError:
+            raise
         except Exception as exc:
             result.failures.append(
                 SeriesFileResult(
