@@ -65,6 +65,7 @@ from .profile import (
     values_for_profile as _values_for_profile,
 )
 from .plan import (
+    INTERRUPT_SENTINEL,
     approve_pending_plan as _approve_pending_plan,
     build_plan_toggle_key_bindings as _build_plan_toggle_key_bindings,
     handle_plan_command as _handle_plan_command,
@@ -817,12 +818,16 @@ class SubBakeAgent:
         prompt = f"sbake[{self.profile or 'default'}{mode}]> "
         prompt_toolkit_prompt = _prompt_toolkit_prompt()
         if self.interactive and prompt_toolkit_prompt is not None:
-            return prompt_toolkit_prompt(
+            result = prompt_toolkit_prompt(
                 prompt,
                 completer=_slash_command_completer(),
                 key_bindings=_build_plan_toggle_key_bindings(self),
                 history=self._build_input_history(),
             )
+            if result == INTERRUPT_SENTINEL:
+                self.console.print("[bold yellow]interrupted[/bold yellow]")
+                return ""
+            return result
         return self.console.input(prompt, markup=False)
 
 

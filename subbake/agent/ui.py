@@ -117,6 +117,7 @@ def print_help(console: Console) -> None:
                 "Controls:",
                 "  Tab                    complete slash commands & autocomplete",
                 "  Shift+Tab               toggle plan mode",
+                "  Esc/Ctrl+C               cancel current input",
                 "  /model or /profile      choose a model profile",
                 "  /model <profile>        switch profile directly",
                 "  /session                choose a previous session",

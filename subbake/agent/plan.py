@@ -17,6 +17,9 @@ from .trace import (
     _slash_command_matches,
     _unique_slash_command_match,
 )
+
+# Sentinel returned when the user presses ESC or Ctrl+C to cancel input.
+INTERRUPT_SENTINEL = "__subbake_interrupted__"
 from .ui import print_tool_call_preview
 
 
@@ -115,6 +118,11 @@ def build_plan_toggle_key_bindings(agent: SubBakeAgent):
         return None
 
     key_bindings = KeyBindings()
+
+    @key_bindings.add("escape")
+    @key_bindings.add("c-c")
+    def _interrupt(event) -> None:
+        event.app.exit(result=INTERRUPT_SENTINEL)
 
     @key_bindings.add("s-tab")
     def _toggle(event) -> None:
