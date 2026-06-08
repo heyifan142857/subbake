@@ -4,6 +4,29 @@ This file tracks notable changes for each release.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-06-08
+
+### Added
+
+- **Chat handler**: the interactive agent now responds to conversational queries with LLM-powered replies, using up to 16 recent session events for context, instead of falling back to a hardcoded message. Falls back gracefully when no LLM backend or MockBackend is active.
+- **Language inference**: when a translation request omits the target language, the agent detects the user's own query language (Japanese kana → Japanese, Korean hangul → Korean, Chinese CJK → Chinese, Latin → English) and uses it as the translation target. An explicit target language in the message still takes priority.
+- **REPL history navigation**: up/down arrow keys recall previously typed commands, built from session events (capped at 100 entries).
+- **Loading spinner**: a Rich `console.status` spinner appears while waiting for chat LLM responses, matching the existing pattern in the agent loop.
+- **Esc/Ctrl+C interrupt**: pressing Esc or Ctrl+C at the prompt immediately cancels the current input and returns to a fresh prompt, giving a quick way to discard a half-typed command.
+- **In-flight operation cancellation**: in-progress translation, series, and editing operations can be cancelled with Esc. Pipeline checkpoints check for cancellation between all stages (load, parse, translate, validate, review, write). Introduces `subbake/cancellation.py` with `cancellation_scope`, `run_interruptibly`, and `OperationCancelledError`.
+- **`/resume` session picker**: typing `/resume` shows a selectable list of recent sessions instead of silently resuming the latest one. After switching, the last 3 user/assistant exchanges are replayed for context.
+- **`/history` command**: shows full conversation history with an optional numeric limit (e.g., `/history 5`).
+- **`sbake resume <id>`**: resume a specific session by ID instead of the most recent one.
+- **Esc/Ctrl+C distinction**: Esc cancels current input (returns to fresh prompt), Ctrl+C exits the agent entirely (session is auto-saved). Applied to the REPL, inline pickers, and inline-text prompts.
+- **Conversation summary on resume**: a summary of prior conversation is injected into the LLM context on session resume, preventing the agent from re-greeting the user.
+- **Cancellation test suite**: tests for cancellation scope creation, nested scopes, `run_interruptibly` during LLM calls, and cancellation checkpoints across all pipeline stages (`test_cancellation.py`).
+
+### Fixed
+
+- **Session history persistence**: assistant messages and cancellation events are now persisted in session history, so `/resume` and `/history` show complete conversations instead of only user messages. Tool execution results (translate, series, edit) are accompanied by a human-readable "assistant" event.
+- **Diagnose/edit/translation summaries**: events now carry human-readable summary fields for accurate conversation replay.
+- **Inline-picker Ctrl+C propagation**: inline pickers no longer catch `KeyboardInterrupt` with blanket try/except, so Ctrl+C exits the agent as intended.
+
 ## [0.4.2] - 2026-06-07
 
 ### Added
