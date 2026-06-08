@@ -196,6 +196,7 @@ class SubBakeAgent:
                 should_continue = self._handle_line(stripped)
             except OperationCancelledError:
                 self.console.print("[bold yellow]Operation cancelled.[/bold yellow]")
+                self._record_event("assistant", "Operation cancelled.", {"decision": "cancelled"})
                 should_continue = True
             except KeyboardInterrupt:
                 self.console.print("")

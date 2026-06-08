@@ -93,6 +93,17 @@ def translate_file(
             "fast": bool(values.get("fast", False)),
         },
     )
+    # Record assistant event so translation results appear in conversation history
+    if result.dry_run:
+        agent._record_event(
+            "assistant", f"已规划 {path.name}，共 {result.batches_translated} 批次。",
+            {"decision": "tool_call", "tool": "translate_file"},
+        )
+    else:
+        agent._record_event(
+            "assistant", f"已完成翻译，输出 {result.output_path}。",
+            {"decision": "tool_call", "tool": "translate_file"},
+        )
     if result.output_path is not None and not result.dry_run:
         _record_translation_output_file_operation(
             agent,
@@ -128,6 +139,10 @@ def translate_series_tool(
                 "path": str(path),
                 "suffixes": sorted(suffixes) if suffixes else None,
             },
+        )
+        agent._record_event(
+            "assistant", "未找到需要翻译的字幕文件。",
+            {"decision": "tool_call", "tool": "translate_series"},
         )
         return
     values = agent._translation_values_for_tool(arguments)
@@ -185,6 +200,17 @@ def translate_series_tool(
             "summary": _series_summary(result, values),
         },
     )
+    # Record assistant event so series translation results appear in conversation history
+    if result.failure_count:
+        agent._record_event(
+            "assistant", f"已完成 {result.processed_count} 个，跳过 {result.skipped_count} 个，失败 {result.failure_count} 个。",
+            {"decision": "tool_call", "tool": "translate_series"},
+        )
+    else:
+        agent._record_event(
+            "assistant", f"已完成 {result.processed_count} 个文件翻译。",
+            {"decision": "tool_call", "tool": "translate_series"},
+        )
     operation_group_id = uuid.uuid4().hex
     for item in result.processed:
         if item.output_path is None:
@@ -244,6 +270,10 @@ def edit_generated_subtitle(
             "instruction": instruction,
             "summary": f"编辑了 {result.target_path.name}：{_short_instruction(instruction)}",
         },
+    )
+    agent._record_event(
+        "assistant", f"已完成编辑，输出 {result.target_path}。",
+        {"decision": "tool_call", "tool": "edit_subtitle"},
     )
 
 
