@@ -94,6 +94,13 @@ class AgentSessionStore:
             return None
         return self.load(sessions[-1])
 
+    def find_by_id(self, session_id: str) -> AgentSession | None:
+        """Find a session by its full ID."""
+        path = self.path_for(session_id)
+        if path.exists():
+            return self.load(path)
+        return None
+
     def list_sessions(self) -> list[Path]:
         if not self.root.exists():
             return []

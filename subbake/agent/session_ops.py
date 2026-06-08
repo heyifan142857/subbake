@@ -153,17 +153,27 @@ def resume_latest_session(agent: SubBakeAgent) -> None:
     _show_session_replay(agent)
 
 
+MAX_REPLAY_EVENTS = 40
+
+
 def _show_session_replay(agent: SubBakeAgent) -> None:
-    """Display the last few exchanges from the session's conversation history."""
+    """Display the full conversation history from the session."""
     events = [
         e for e in agent.session.events
         if e.get("kind") in ("user", "assistant")
     ]
-    recent = events[-6:]  # last 3 user/assistant pairs
-    if not recent:
+    if not events:
         return
-    agent.console.print("[bold]─── Recent conversation ───[/bold]")
-    for event in recent:
+    total = len(events)
+    # Show last MAX_REPLAY_EVENTS, note count of skipped ones
+    show = events[-MAX_REPLAY_EVENTS:]
+    skipped = total - len(show)
+    agent.console.print("[bold]─── Conversation history ───[/bold]")
+    if skipped > 0:
+        agent.console.print(
+            f"  [dim]… and {skipped} earlier message(s) (use /history to see all)[/dim]"
+        )
+    for event in show:
         kind = event.get("kind", "")
         text = (event.get("input", "") or "").strip()
         if not text:
@@ -181,9 +191,51 @@ def _print_event_line(agent: SubBakeAgent, kind: str, text: str) -> None:
         agent.console.print(f"  [dim]Assistant:[/dim] {preview}")
 
 
-def load_or_create_session(agent: SubBakeAgent, *, resume: bool) -> AgentSession:
-    """Load the latest session (if resume=True) or create a new one."""
-    if resume:
+def print_full_history(agent: SubBakeAgent, *, limit: int | None = None) -> None:
+    """Print all user/assistant events with index numbers.
+
+    Args:
+        agent: The agent instance.
+        limit: If set, show only the last N exchanges (pairs). Each exchange
+               is one user input followed by one assistant response.
+    """
+    events = [
+        e for e in agent.session.events
+        if e.get("kind") in ("user", "assistant")
+    ]
+    if not events:
+        agent.console.print("[bold yellow]No conversation history found.[/bold yellow]")
+        return
+
+    if limit is not None and limit > 0:
+        # Show last N exchanges (each exchange is a user+assistant pair = 2 events)
+        pair_count = limit * 2
+        events = events[-pair_count:]
+
+    agent.console.print("[bold]─── Full conversation history ───[/bold]")
+    for idx, event in enumerate(events, start=1):
+        kind = event.get("kind", "")
+        text = (event.get("input", "") or "").strip()
+        if not text:
+            continue
+        if kind == "user":
+            agent.console.print(f"  [bold]{idx}. You:[/bold] {text}")
+        elif kind == "assistant":
+            agent.console.print(f"     [dim]Assistant:[/dim] {text}")
+    agent.console.print("[bold]─── End ───[/bold]")
+    total_pairs = len(events) // 2
+    agent.console.print(f"[dim]{total_pairs} exchange(s) shown ({len(events)} message(s))[/dim]")
+
+
+def load_or_create_session(agent: SubBakeAgent, *, resume: bool, session_id: str | None = None) -> AgentSession:
+    """Load the latest session (if resume=True) or a specific session (if session_id given), else create a new one."""
+    if session_id is not None:
+        found = agent.store.find_by_id(session_id)
+        if found is not None:
+            agent.console.print(f"[bold green]Resumed session:[/bold green] {found.id}  {session_title(agent, found)}")
+            return found
+        agent.console.print(f"[bold yellow]Session '{session_id}' not found. Starting a new one.[/bold yellow]")
+    elif resume:
         latest = agent.store.latest()
         if latest is not None:
             agent.console.print(f"[bold green]Resumed session:[/bold green] {latest.id}")

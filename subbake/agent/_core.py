@@ -5,7 +5,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from rich.console import Console
 from rich.text import Text
@@ -65,6 +65,7 @@ from .profile import (
     values_for_profile as _values_for_profile,
 )
 from .plan import (
+    EXIT_SENTINEL,
     INTERRUPT_SENTINEL,
     approve_pending_plan as _approve_pending_plan,
     build_plan_toggle_key_bindings as _build_plan_toggle_key_bindings,
@@ -84,8 +85,10 @@ from .target import (
 from .session_ops import (
     handle_session_command as _handle_session_command,
     load_or_create_session as _load_or_create_session,
+    print_full_history as _print_full_history,
     print_sessions as _print_sessions,
     resume_latest_session as _resume_latest_session,
+    _show_session_replay as _show_session_replay,
 )
 from .text_helpers import (
     extract_references as _extract_references,
@@ -137,7 +140,9 @@ from subbake.file_ops import FileOpResult, FileOperationGuard
 # build_backend_from_values is accessed via _runtime_options module reference
 # so that tests can patch the source module.
 from subbake import runtime_options as _runtime_options
+from subbake.cancellation import cancellation_scope, run_interruptibly
 from subbake.models.base_model import MockBackend
+from subbake.pipeline import OperationCancelledError
 from subbake.title_matching import title_tokens_from_text
 
 AGENT_LOOP_MAX_STEPS = 5
@@ -149,7 +154,7 @@ PICKER_CANCEL_TOKEN = "__subbake_picker_cancelled__"  # also in agent_trace; kep
 
 
 class SubBakeAgent:
-    def __init__(self, *, console: Console, resume: bool = False) -> None:
+    def __init__(self, *, console: Console, resume: bool = False, session_id: str | None = None) -> None:
         self.console = console
         self.cwd = Path.cwd()
         self.config_path = _config.discover_config_path()
@@ -160,10 +165,14 @@ class SubBakeAgent:
         self.interactive = sys.stdin.isatty() and sys.stdout.isatty()
         self.profile = _initial_profile(self)
         self.values = _values_for_profile(self, self.profile)
-        self.session = _load_or_create_session(self, resume=resume)
+        self._cancel_requested: Callable[[], bool] | None = None
+        self.session = _load_or_create_session(self, resume=resume, session_id=session_id)
         if self.session.profile != self.profile:
             self.session.profile = self.profile
         self.store.save(self.session)
+        # Show conversation replay if this is a resumed session
+        if (resume or session_id is not None) and self.session.events:
+            _show_session_replay(self)
 
     def run(self) -> None:
         self.console.print(f"[bold green]SubBake agent {__version__}[/bold green]  /help for commands, /exit to quit")
@@ -176,14 +185,22 @@ class SubBakeAgent:
         while True:
             try:
                 line = self._read_line()
-            except EOFError:
+            except (KeyboardInterrupt, EOFError):
                 self.console.print("")
+                self.store.save(self.session)
                 break
             stripped = line.strip()
             if not stripped:
                 continue
             try:
                 should_continue = self._handle_line(stripped)
+            except OperationCancelledError:
+                self.console.print("[bold yellow]Operation cancelled.[/bold yellow]")
+                should_continue = True
+            except KeyboardInterrupt:
+                self.console.print("")
+                self.store.save(self.session)
+                break
             except Exception as exc:
                 self.console.print(f"[bold red]Error:[/bold red] {exc}")
                 self._record_event("error", stripped, {"error": str(exc)})
@@ -191,6 +208,18 @@ class SubBakeAgent:
             self.store.save(self.session)
             if not should_continue:
                 break
+
+        self._print_exit_message()
+
+    def _print_exit_message(self) -> None:
+        """Suggest how to resume the session after exit."""
+        if self.interactive:
+            self.console.print(
+                f"[dim]Session saved. To resume, run: sbake resume {self.session.id}[/dim]"
+            )
+            self.console.print(
+                "[dim](or just: sbake resume)[/dim]"
+            )
 
     def _handle_line(self, line: str) -> bool:
         command, rest = _split_command(line)
@@ -221,6 +250,10 @@ class SubBakeAgent:
             _print_sessions(self)
             self._record_event("sessions", line)
             return True
+        if command == "/history":
+            _print_full_history(self, limit=_parse_history_limit(rest))
+            self._record_event("history", line)
+            return True
         if command == "/resume":
             _resume_latest_session(self)
             return True
@@ -228,7 +261,7 @@ class SubBakeAgent:
             _handle_plan_command(self, rest)
             return True
         if command == "/approve":
-            _approve_pending_plan(self)
+            self._run_with_cancellation(lambda: _approve_pending_plan(self))
             return True
         if command == "/reject":
             _reject_pending_plan(self)
@@ -241,8 +274,24 @@ class SubBakeAgent:
             self._record_event("unknown_command", line, {"command": command})
             return True
 
-        self._handle_conversational_line(line)
+        self._run_with_cancellation(lambda: self._handle_conversational_line(line))
         return True
+
+    def _run_with_cancellation(self, operation: Callable[[], Any]) -> Any:
+        if self._cancel_requested is not None:
+            return operation()
+        with cancellation_scope(enable_escape=self.interactive) as cancel_requested:
+            self._cancel_requested = cancel_requested
+            try:
+                return operation()
+            finally:
+                self._cancel_requested = None
+
+    def _generate_json(self, backend, messages: list[dict[str, str]]):
+        return run_interruptibly(
+            lambda: backend.generate_json(messages),
+            cancel_requested=self._cancel_requested,
+        )
 
     def _handle_conversational_line(self, line: str) -> None:
         self._record_event("user", line)
@@ -275,12 +324,14 @@ class SubBakeAgent:
         try:
             if self.interactive:
                 with self.console.status("thinking", spinner="dots"):
-                    payload, _ = backend.generate_json(messages)
+                    payload, _ = self._generate_json(backend, messages)
             else:
-                payload, _ = backend.generate_json(messages)
+                payload, _ = self._generate_json(backend, messages)
             response = str(payload.get("message", "") or "").strip()
             if not response:
                 response = "How can I help with your subtitles?"
+        except OperationCancelledError:
+            raise
         except Exception:
             response = "How can I help with your subtitles?"
 
@@ -290,6 +341,14 @@ class SubBakeAgent:
 
     def _build_chat_messages(self, line: str) -> list[dict[str, str]]:
         """Build a chat message list with conversation history for casual chat."""
+        conversation_summary = self._build_conversation_summary(max_exchanges=10, max_chars=2000)
+        history_note = ""
+        if conversation_summary:
+            history_note = (
+                "\n\nPrevious conversation in this session:\n"
+                f"{conversation_summary}\n\n"
+                "Continue naturally — do not re-greet."
+            )
         system_prompt = (
             "你是 SubBake，一个友好的字幕翻译助手。你可以帮助用户翻译字幕文件（.srt、.vtt、.txt），"
             "也可以闲聊。请用用户使用的语言自然、简洁地回复。\n"
@@ -297,7 +356,7 @@ class SubBakeAgent:
             "You are SubBake, a friendly subtitle translation assistant. You help users translate "
             "subtitle files (.srt, .vtt, .txt) using AI models. You can also chat casually.\n"
             "Respond in the user's language naturally and concisely.\n"
-            "Return JSON: {\"message\": \"your response\"}"
+            f"Return JSON: {{\"message\": \"your response\"}}{history_note}"
         )
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
@@ -385,9 +444,9 @@ class SubBakeAgent:
         messages = self._build_agent_loop_decision_messages(state)
         if self.interactive and show_status:
             with self.console.status("Model thinking...", spinner="dots"):
-                payload, _ = backend.generate_json(messages)
+                payload, _ = self._generate_json(backend, messages)
         else:
-            payload, _ = backend.generate_json(messages)
+            payload, _ = self._generate_json(backend, messages)
         if not isinstance(payload, dict):
             raise ValueError("Agent loop decision must be a JSON object.")
         action = str(payload.get("action") or "").strip()
@@ -413,20 +472,40 @@ class SubBakeAgent:
             "recent_events": self.session.events[-20:],
             "tools": filtered_tools,
         }
-        system_prompt = (
-            "You are SubBake's bounded local project agent.\n"
-            "Return valid JSON only.\n"
-            "Choose one action: respond, ask_user, tool_call, final_tool_call, or plan.\n"
+
+        # Add conversation summary when resuming (session has prior events)
+        conversation_summary = self._build_conversation_summary()
+        has_history = bool(conversation_summary)
+
+        system_parts = [
+            "You are SubBake's bounded local project agent.",
+        ]
+        if has_history:
+            system_parts.append(
+                "You are continuing a previous conversation. "
+                "Do not re-greet the user or ask what they want to do — "
+                "pick up naturally from where you left off."
+            )
+        system_parts.extend([
+            "Return valid JSON only.",
+            "Choose one action: respond, ask_user, tool_call, final_tool_call, or plan.",
             "Use tool_call only for safe discovery tools: list_files, search_files, "
-            "recent_translations, candidate_subtitles, read_file_preview.\n"
-            "Use final_tool_call when enough evidence supports one executable tool.\n"
-            "Discovery before mutation is required when the target path is uncertain.\n"
-            "Never claim a file exists unless it is present in references or tool observations.\n"
-            "If multiple strong subtitle candidates remain, return ask_user with the choices.\n"
-            "In plan mode, discovery tools may run; executable final actions will be stored for approval.\n"
+            "recent_translations, candidate_subtitles, read_file_preview.",
+            "Use final_tool_call when enough evidence supports one executable tool.",
+            "Discovery before mutation is required when the target path is uncertain.",
+            "Never claim a file exists unless it is present in references or tool observations.",
+            "If multiple strong subtitle candidates remain, return ask_user with the choices.",
+            "In plan mode, discovery tools may run; executable final actions will be stored for approval.",
             "When the context includes an intent_hint, trust its category and reason "
-            "unless observations contradict it — do not re-derive the user's intent from scratch.\n"
-        )
+            "unless observations contradict it — do not re-derive the user's intent from scratch.",
+        ])
+        system_prompt = "\n".join(system_parts)
+
+        # Include conversation summary in context when available
+        context_with_summary = dict(context)
+        if has_history:
+            context_with_summary["conversation_summary"] = conversation_summary
+
         user_prompt = (
             "TASK_START\n"
             "agent_loop_decide\n"
@@ -435,7 +514,7 @@ class SubBakeAgent:
             'For tool_call or final_tool_call include "tool_name" and "arguments". '
             'For plan include "tool_calls".\n'
             "AGENT_LOOP_CONTEXT_JSON_START\n"
-            f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"{json.dumps(context_with_summary, ensure_ascii=False, separators=(',', ':'))}\n"
             "AGENT_LOOP_CONTEXT_JSON_END\n"
         )
         return [
@@ -586,7 +665,13 @@ class SubBakeAgent:
             text = str(arguments.get("text") or "")
             report = diagnose_text(text)
             self.console.print(format_diagnostic_report(report))
-            self._record_event("diagnose_text", original, {"diagnosis": report.diagnosis})
+            self._record_event(
+                "diagnose_text", original,
+                {
+                    "diagnosis": report.diagnosis,
+                    "summary": f"分析了文本：{report.diagnosis}",
+                },
+            )
             return ""
         if tool_name == "edit_subtitle":
             target_path = self._resolve_user_path(str(arguments.get("path") or ""))
@@ -768,7 +853,14 @@ class SubBakeAgent:
     def _diagnose_path(self, path: Path, *, original: str) -> None:
         report = diagnose_path(path)
         self.console.print(format_diagnostic_report(report))
-        self._record_event("diagnose_path", original, {"path": str(path), "diagnosis": report.diagnosis})
+        self._record_event(
+            "diagnose_path", original,
+            {
+                "path": str(path),
+                "diagnosis": report.diagnosis,
+                "summary": f"分析了 {path.name}：{report.diagnosis}",
+            },
+        )
 
     def _print_help(self) -> None:
         _print_help_fn(self.console)
@@ -813,6 +905,60 @@ class SubBakeAgent:
                     count += 1
         return history
 
+    def _build_conversation_summary(self, *, max_exchanges: int = 15, max_chars: int = 3000) -> str:
+        """Build a concise narrative summary of the conversation so far.
+
+        Uses enriched event data (e.g. ``data.summary``) to produce
+        self-contained exchange descriptions.  Truncated at *max_chars* characters.
+        """
+        lines: list[str] = []
+        exchange_count = 0
+
+        user_text = ""
+        for event in self.session.events:
+            kind = event.get("kind", "")
+            data = event.get("data") or {}
+            if len("\n".join(lines)) > max_chars:
+                break
+
+            if kind == "user":
+                user_text = (event.get("input", "") or "").strip()
+                continue
+
+            if kind == "assistant":
+                if not user_text:
+                    continue
+                assistant_text = (event.get("input", "") or "").strip()
+                decision = data.get("decision", "")
+                # Shorter for tool decisions, keep full for chat responses
+                if decision in ("tool_call", "ask_user"):
+                    exchange = f"User: {_truncate_text(user_text, 80)} → {_truncate_text(assistant_text, 100)}"
+                else:
+                    exchange = f"User: {_truncate_text(user_text, 60)} → Assistant: {_truncate_text(assistant_text, 120)}"
+                lines.append(exchange)
+                exchange_count += 1
+                user_text = ""
+                continue
+
+            # Tool result events with a summary field
+            summary = data.get("summary", "")
+            if summary and user_text:
+                exchange = f"User: {_truncate_text(user_text, 80)} → {summary}"
+                lines.append(exchange)
+                exchange_count += 1
+                user_text = ""
+                continue
+
+        # Keep only the last max_exchanges exchanges
+        if len(lines) > max_exchanges:
+            lines = lines[-max_exchanges:]
+            lines.insert(0, f"… ({exchange_count - max_exchanges} earlier exchange(s))")
+
+        if not lines:
+            return ""
+
+        return f"Previous conversation ({len(lines)} exchange(s)):\n" + "\n".join(lines)
+
     def _read_line(self) -> str:
         mode = "|plan" if self.session.mode == "plan" else ""
         prompt = f"sbake[{self.profile or 'default'}{mode}]> "
@@ -827,10 +973,30 @@ class SubBakeAgent:
             if result == INTERRUPT_SENTINEL:
                 self.console.print("[bold yellow]interrupted[/bold yellow]")
                 return ""
+            if result == EXIT_SENTINEL:
+                raise KeyboardInterrupt()
             return result
         return self.console.input(prompt, markup=False)
 
 
-def start_interactive_agent(*, console: Console, resume: bool = False) -> None:
-    SubBakeAgent(console=console, resume=resume).run()
+def start_interactive_agent(*, console: Console, resume: bool = False, session_id: str | None = None) -> None:
+    SubBakeAgent(console=console, resume=resume, session_id=session_id).run()
 
+
+def _parse_history_limit(rest: str) -> int | None:
+    """Parse an optional integer limit from the /history argument."""
+    cleaned = rest.strip()
+    if not cleaned:
+        return None
+    try:
+        val = int(cleaned)
+        return val if val > 0 else None
+    except ValueError:
+        return None
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    """Truncate text with an ellipsis if it exceeds *limit* characters."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit - 3]}..."

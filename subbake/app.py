@@ -554,12 +554,17 @@ def series(
 
 
 @app.command()
-def resume() -> None:
-    """Resume the latest interactive agent session."""
+def resume(
+    session_id: str | None = typer.Argument(
+        None,
+        help="Optional session ID to resume. If omitted, shows an interactive picker or resumes the latest session.",
+    ),
+) -> None:
+    """Resume an interactive agent session."""
 
     from subbake.agent import start_interactive_agent
 
-    start_interactive_agent(console=console, resume=True)
+    start_interactive_agent(console=console, resume=session_id is None, session_id=session_id)
 
 
 @app.command("check-key")

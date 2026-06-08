@@ -32,6 +32,7 @@ AGENT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/profile", "choose a model profile"),
     ("/session", "choose a session"),
     ("/sessions", "list recent sessions"),
+    ("/history", "show full conversation history"),
     ("/clear", "start a new session"),
     ("/plan", "turn plan mode on"),
     ("/plan off", "turn plan mode off"),
@@ -270,9 +271,12 @@ def _prompt_toolkit_inline_picker(title: str, options: list[tuple[str, str]], *,
         event.app.exit(result=buffer.text)
 
     @key_bindings.add("escape")
-    @key_bindings.add("c-c")
     def _cancel(event) -> None:
         event.app.exit(result=PICKER_CANCEL_TOKEN)
+
+    @key_bindings.add("c-c")
+    def _exit(event) -> None:
+        raise KeyboardInterrupt()
 
     style = Style.from_dict(
         {
@@ -284,20 +288,17 @@ def _prompt_toolkit_inline_picker(title: str, options: list[tuple[str, str]], *,
         }
     )
 
-    try:
-        raw_selection = prompt(
-            _picker_prompt(title),
-            completer=InlinePickerCompleter(),
-            complete_while_typing=True,
-            complete_style=CompleteStyle.COLUMN,
-            key_bindings=key_bindings,
-            reserve_space_for_menu=8,
-            bottom_toolbar=_picker_toolbar(title),
-            style=style,
-            pre_run=lambda: get_app().current_buffer.start_completion(select_first=True),
-        )
-    except KeyboardInterrupt:
-        return PICKER_CANCEL_TOKEN
+    raw_selection = prompt(
+        _picker_prompt(title),
+        completer=InlinePickerCompleter(),
+        complete_while_typing=True,
+        complete_style=CompleteStyle.COLUMN,
+        key_bindings=key_bindings,
+        reserve_space_for_menu=8,
+        bottom_toolbar=_picker_toolbar(title),
+        style=style,
+        pre_run=lambda: get_app().current_buffer.start_completion(select_first=True),
+    )
     if raw_selection == PICKER_CANCEL_TOKEN:
         return PICKER_CANCEL_TOKEN
     return _resolve_picker_selection(raw_selection, choices, default=default) or PICKER_CANCEL_TOKEN
@@ -442,9 +443,12 @@ def _prompt_toolkit_inline_text(
         event.app.exit(result=buffer.text)
 
     @key_bindings.add("escape")
-    @key_bindings.add("c-c")
     def _cancel(event) -> None:
         event.app.exit(result=PICKER_CANCEL_TOKEN)
+
+    @key_bindings.add("c-c")
+    def _exit(event) -> None:
+        raise KeyboardInterrupt()
 
     style = Style.from_dict(
         {
@@ -454,19 +458,16 @@ def _prompt_toolkit_inline_text(
         }
     )
 
-    try:
-        raw_value = prompt(
-            _text_prompt(text),
-            completer=InlineTextCompleter() if completions else None,
-            complete_while_typing=True,
-            complete_style=CompleteStyle.COLUMN,
-            key_bindings=key_bindings,
-            reserve_space_for_menu=6,
-            bottom_toolbar=_text_prompt_toolbar(title, text, default),
-            style=style,
-        )
-    except KeyboardInterrupt:
-        return PICKER_CANCEL_TOKEN
+    raw_value = prompt(
+        _text_prompt(text),
+        completer=InlineTextCompleter() if completions else None,
+        complete_while_typing=True,
+        complete_style=CompleteStyle.COLUMN,
+        key_bindings=key_bindings,
+        reserve_space_for_menu=6,
+        bottom_toolbar=_text_prompt_toolbar(title, text, default),
+        style=style,
+    )
     if raw_value == PICKER_CANCEL_TOKEN:
         return PICKER_CANCEL_TOKEN
     return _resolve_text_prompt_value(raw_value, default=default)

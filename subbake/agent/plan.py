@@ -18,8 +18,10 @@ from .trace import (
     _unique_slash_command_match,
 )
 
-# Sentinel returned when the user presses ESC or Ctrl+C to cancel input.
+# Sentinel returned when the user presses Esc to cancel input.
 INTERRUPT_SENTINEL = "__subbake_interrupted__"
+# Sentinel returned when the user presses Ctrl+C to exit.
+EXIT_SENTINEL = "__subbake_exit__"
 from .ui import print_tool_call_preview
 
 
@@ -60,7 +62,13 @@ def approve_pending_plan(agent: SubBakeAgent) -> None:
         if result:
             agent.console.print(result)
     agent.session.pending_plan = None
-    agent._record_event("approve", "/approve", {"executed": len(tool_calls)})
+    agent._record_event(
+        "approve", "/approve",
+        {
+            "executed": len(tool_calls),
+            "summary": f"执行了 {len(tool_calls)} 个已批准的工具操作",
+        },
+    )
 
 
 def reject_pending_plan(agent: SubBakeAgent) -> None:
@@ -120,9 +128,13 @@ def build_plan_toggle_key_bindings(agent: SubBakeAgent):
     key_bindings = KeyBindings()
 
     @key_bindings.add("escape")
-    @key_bindings.add("c-c")
     def _interrupt(event) -> None:
+        event.current_buffer.reset()
         event.app.exit(result=INTERRUPT_SENTINEL)
+
+    @key_bindings.add("c-c")
+    def _exit(event) -> None:
+        event.app.exit(result=EXIT_SENTINEL)
 
     @key_bindings.add("s-tab")
     def _toggle(event) -> None:
