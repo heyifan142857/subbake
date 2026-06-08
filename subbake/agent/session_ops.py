@@ -129,7 +129,20 @@ def session_title(agent: SubBakeAgent, session: AgentSession) -> str:
 
 
 def resume_latest_session(agent: SubBakeAgent) -> None:
-    """Resume the most recent session."""
+    """Resume a session — show interactive picker of recent sessions."""
+    options = session_options(agent, limit=10)
+    if not options:
+        agent.console.print("[bold yellow]No previous agent session found.[/bold yellow]")
+        return
+    if agent.interactive:
+        selected = select_from_list(agent.console, agent.interactive, "Resume session", options, default=agent.session.id)
+        if selected is None:
+            return
+        switch_session_by_key(agent, selected)
+        agent._record_event("resume", "/resume", {"session_id": selected})
+        _show_session_replay(agent)
+        return
+    # Non-interactive fallback: resume the latest session
     latest = agent.store.latest()
     if latest is None:
         agent.console.print("[bold yellow]No previous agent session found.[/bold yellow]")
@@ -137,6 +150,35 @@ def resume_latest_session(agent: SubBakeAgent) -> None:
     activate_session(agent, latest)
     agent.console.print(f"[bold green]Resumed session:[/bold green] {latest.id}  {session_title(agent, latest)}")
     agent._record_event("resume", "/resume", {"session_id": latest.id})
+    _show_session_replay(agent)
+
+
+def _show_session_replay(agent: SubBakeAgent) -> None:
+    """Display the last few exchanges from the session's conversation history."""
+    events = [
+        e for e in agent.session.events
+        if e.get("kind") in ("user", "assistant")
+    ]
+    recent = events[-6:]  # last 3 user/assistant pairs
+    if not recent:
+        return
+    agent.console.print("[bold]─── Recent conversation ───[/bold]")
+    for event in recent:
+        kind = event.get("kind", "")
+        text = (event.get("input", "") or "").strip()
+        if not text:
+            continue
+        _print_event_line(agent, kind, text)
+    agent.console.print("[bold]─── End ───[/bold]")
+
+
+def _print_event_line(agent: SubBakeAgent, kind: str, text: str) -> None:
+    """Print a single event line with appropriate styling."""
+    preview = text if len(text) <= 120 else f"{text[:117]}..."
+    if kind == "user":
+        agent.console.print(f"  [bold]You:[/bold] {preview}")
+    elif kind == "assistant":
+        agent.console.print(f"  [dim]Assistant:[/dim] {preview}")
 
 
 def load_or_create_session(agent: SubBakeAgent, *, resume: bool) -> AgentSession:
