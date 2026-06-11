@@ -4,6 +4,10 @@ This file tracks notable changes for each release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **In-flight Ctrl+C cancellation**: while the agent is running a task, Ctrl+C now behaves like Esc and cancels the active operation instead of exiting the agent. At an idle prompt, Ctrl+C still exits and saves the session.
+
 ## [0.4.3] - 2026-06-08
 
 ### Added

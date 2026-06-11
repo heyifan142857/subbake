@@ -130,7 +130,7 @@ def print_help(console: Console) -> None:
                 "  Tab                    complete slash commands & autocomplete",
                 "  Shift+Tab               toggle plan mode",
                 "  Esc                    cancel current input or running task",
-                "  Ctrl+C                 exit immediately (session is saved, resume with sbake resume)",
+                "  Ctrl+C                 cancel running task, or exit when idle",
                 "  /model or /profile      choose a model profile",
                 "  /model <profile>        switch profile directly",
                 "  /session                choose a previous session",

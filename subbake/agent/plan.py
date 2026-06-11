@@ -20,7 +20,7 @@ from .trace import (
 
 # Sentinel returned when the user presses Esc to cancel input.
 INTERRUPT_SENTINEL = "__subbake_interrupted__"
-# Sentinel returned when the user presses Ctrl+C to exit.
+# Sentinel returned when the user presses Ctrl+C at the prompt to exit.
 EXIT_SENTINEL = "__subbake_exit__"
 APPROVAL_REQUIRED_TOOL_NAMES = frozenset({"manage_whisper"})
 from .ui import print_tool_call_preview

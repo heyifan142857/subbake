@@ -33,15 +33,14 @@ class CancellationTestCase(unittest.TestCase):
         finally:
             restore()
 
-    def test_ctrl_c_raises_keyboard_interrupt_immediately(self):
+    def test_ctrl_c_sets_cancel_requested_while_handler_installed(self):
         cancel_requested, restore = install_cancellation_handler(
             stderr_fileno=self._null_fd,
             enable_escape=False,
         )
         try:
-            with self.assertRaises(KeyboardInterrupt):
-                os.kill(os.getpid(), signal.SIGINT)
-            self.assertFalse(cancel_requested())
+            os.kill(os.getpid(), signal.SIGINT)
+            self.assertTrue(cancel_requested())
         finally:
             restore()
 

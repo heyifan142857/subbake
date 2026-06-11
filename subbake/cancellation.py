@@ -1,7 +1,7 @@
 """Runtime cancellation helpers for interactive operations.
 
-During a running interactive command, Esc requests cancellation and returns to
-the prompt. Ctrl+C exits immediately by raising KeyboardInterrupt.
+During a running interactive command, Esc and Ctrl+C request cancellation and
+return to the prompt.
 """
 
 from __future__ import annotations
@@ -57,16 +57,15 @@ def install_cancellation_handler(
     """Install runtime cancellation handling.
 
     Esc sets the returned cancellation flag when stdin is an interactive TTY.
-    Ctrl+C raises KeyboardInterrupt immediately so the caller can save and exit.
+    Ctrl+C sets the same cancellation flag while this handler is installed.
     """
     write_fd = stderr_fileno if stderr_fileno is not None else sys.__stderr__.fileno()
     read_fd = _interactive_stdin_fileno(stdin_fileno) if enable_escape else None
     state = _CancellationState(stdin_fd=read_fd, write_fd=write_fd)
 
     def _interrupt(signum: int, frame: object | None) -> None:
-        signal.signal(signal.SIGINT, state.original_handler)
+        state.cancelled = True
         _signal_safe_newline(state.write_fd)
-        raise KeyboardInterrupt()
 
     state.original_handler = signal.signal(signal.SIGINT, _interrupt)
     if read_fd is not None:
