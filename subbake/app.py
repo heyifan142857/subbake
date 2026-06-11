@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 import typer
 from click.core import ParameterSource
 from rich.console import Console
+from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TimeRemainingColumn, TransferSpeedColumn
 
 from subbake import __version__
 from subbake.config import (
     CHECK_KEY_CONFIG_KEYS,
+    TRANSCRIBE_CONFIG_KEYS,
     TRANSLATE_CONFIG_KEYS,
     discover_config_path,
     format_config_selection,
@@ -21,6 +24,7 @@ from subbake.models import build_backend
 from subbake.pipeline import SubtitlePipeline
 from subbake.runtime_options import (
     build_pipeline_options,
+    build_transcriber_from_values,
     merge_translation_values,
 )
 from subbake.series import translate_series
@@ -86,6 +90,25 @@ app = typer.Typer(
     help=APP_HELP,
 )
 console = Console()
+
+
+@contextmanager
+def _download_progress(label: str):
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+    with progress:
+        task_id = progress.add_task(label, total=None)
+
+        def update(downloaded: int, total: int) -> None:
+            progress.update(task_id, total=total, completed=downloaded)
+
+        yield update
 
 
 def _version_callback(value: bool) -> None:
@@ -360,6 +383,8 @@ def translate(
     """Translate subtitles while preserving subtitle structure."""
 
     try:
+        from subbake.transcriber import is_media_file, transcribe_to_srt
+
         values, config_selection = _resolve_translation_values(
             ctx=ctx,
             explicit_config_path=config,
@@ -385,8 +410,34 @@ def translate(
             work_dir=work_dir,
             glossary_path=glossary_path,
         )
+
+        # Auto-transcribe media files before translation
+        effective_input = input_path
+        if is_media_file(input_path):
+            console.print(f"[bold green]Media file detected:[/bold green] {input_path.name}")
+            console.print("[bold green]Transcribing to subtitles first...[/bold green]")
+            transcriber_provider = str(values.get("transcriber", "whisper_api"))
+            transcribe_model = (
+                str(values.get("whisper_model", "small"))
+                if transcriber_provider == "whisper_cpp"
+                else str(values.get("whisper_api_model", "whisper-1"))
+            )
+            transcribed_path = transcribe_to_srt(
+                input_path,
+                project_root=Path.cwd(),
+                provider=transcriber_provider,
+                api_key=values.get("api_key"),
+                base_url=values.get("base_url"),
+                model=None if transcriber_provider == "whisper_cpp" else transcribe_model,
+                whisper_model=str(values.get("whisper_model", "small")),
+                language=str(values.get("source_language", "Auto")) or None,
+                output_format=str(values.get("output_format", "srt")),
+            )
+            effective_input = transcribed_path
+            console.print(f"[bold green]Transcribed:[/bold green] {transcribed_path}")
+
         options = build_pipeline_options(
-            input_path=input_path,
+            input_path=effective_input,
             output_path=output,
             values=values,
         )
@@ -712,6 +763,273 @@ def clean(
             console.print(f"  - {item}")
 
 
+@app.command()
+def transcribe(
+    ctx: typer.Context,
+    input_path: Path = typer.Argument(
+        ...,
+        exists=True,
+        dir_okay=False,
+        help="Audio (.wav/.mp3/.m4a) or video (.mp4/.mkv/.avi) file to transcribe.",
+    ),
+    output: Path | None = typer.Option(None, "--output", "-o", dir_okay=False, help="Output subtitle file path."),
+    transcriber: str = typer.Option(
+        "whisper_api",
+        "--transcriber",
+        help="Transcription provider: whisper_api or whisper_cpp.",
+    ),
+    model: str = typer.Option(
+        "small",
+        "--model",
+        help="Whisper model size (whisper_cpp: tiny/base/small/medium/large-v3) or API model name.",
+    ),
+    language: str | None = typer.Option(
+        None,
+        "--language",
+        help="Source language hint (e.g., 'en', 'zh', 'ja'). Omit for auto-detection.",
+    ),
+    output_format: str = typer.Option(
+        "srt",
+        "--output-format",
+        help="Output subtitle format: srt, vtt, or txt.",
+    ),
+    api_key: str | None = typer.Option(None, "--api-key", help="API key for the transcription API."),
+    base_url: str | None = typer.Option(None, "--base-url", help="Base URL for the Whisper API."),
+    config: Path | None = typer.Option(
+        None, "--config", dir_okay=False, exists=True, resolve_path=True,
+        help="Path to subbake.toml.",
+    ),
+    profile: str | None = typer.Option(None, "--profile", help="Named config profile to use."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Plan without calling the transcription API."),
+) -> None:
+    """Transcribe audio/video to subtitle files (SRT/VTT)."""
+    try:
+        config_values, config_selection = _load_command_config(
+            explicit_config_path=config,
+            profile=profile,
+            allowed_keys=TRANSCRIBE_CONFIG_KEYS,
+        )
+        resolved_transcriber = _configured_value(ctx, "transcriber", transcriber, config_values)
+        resolved_model = _configured_value(ctx, "model", model, config_values)
+        resolved_api_key = _configured_value(ctx, "api_key", api_key, config_values)
+        resolved_base_url = _configured_value(ctx, "base_url", base_url, config_values)
+        resolved_output_format = _configured_value(ctx, "output_format", output_format, config_values)
+
+        project_root = Path.cwd()
+
+        if dry_run:
+            console.print(f"[bold yellow]Dry run:[/bold yellow] would transcribe {input_path}")
+            console.print(f"  provider: {resolved_transcriber}")
+            console.print(f"  model: {resolved_model}")
+            console.print(f"  output-format: {resolved_output_format}")
+            config_description = format_config_selection(config_selection)
+            if config_description is not None:
+                console.print(f"  config: {config_description}")
+            return
+
+        from subbake.transcriber import transcribe_to_srt
+
+        output_path = transcribe_to_srt(
+            input_path,
+            project_root=project_root,
+            provider=resolved_transcriber,
+            api_key=resolved_api_key,
+            model=None if resolved_transcriber == "whisper_cpp" else resolved_model,
+            whisper_model=resolved_model if resolved_transcriber == "whisper_cpp" else "small",
+            language=language,
+            output_format=resolved_output_format,
+            output_path=output,
+        )
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[bold green]Output:[/bold green] {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# whisper.cpp management
+# ---------------------------------------------------------------------------
+
+whisper_app = typer.Typer(help="Install and manage whisper.cpp.")
+app.add_typer(whisper_app, name="whisper")
+
+
+@whisper_app.command("install")
+def whisper_install(
+    version: str = typer.Option(
+        "latest",
+        "--version",
+        help="whisper.cpp version tag (e.g. v1.7.0) or 'latest'.",
+    ),
+    model: str = typer.Option(
+        "small",
+        "--model",
+        help="GGML model to download: tiny/base/small/medium/large-v3.",
+    ),
+) -> None:
+    """Download and install whisper.cpp binary and a GGML model."""
+    from subbake.whisper_installer import WhisperInstaller
+
+    try:
+        installer = WhisperInstaller(project_root=Path.cwd())
+        ok, _ = installer.check_available()
+        if ok:
+            binary = installer.ensure_available()
+            console.print(f"[bold green]whisper.cpp already available:[/bold green] {binary}")
+        else:
+            with _download_progress("whisper.cpp") as progress:
+                binary = installer.install(version=version, progress_callback=progress)
+        with _download_progress(f"ggml-{model}.bin") as progress:
+            model_path = installer.download_model(model=model, progress_callback=progress)
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[bold green]Installed:[/bold green] {binary}")
+    console.print(f"[bold green]Model:[/bold green] {model_path}")
+
+
+@whisper_app.command("version")
+def whisper_version() -> None:
+    """Show the installed whisper.cpp version."""
+    from subbake.whisper_installer import WhisperInstaller
+
+    installer = WhisperInstaller(project_root=Path.cwd())
+    ok, msg = installer.check_available()
+    if not ok:
+        console.print("[bold yellow]whisper.cpp is not installed.[/bold yellow]")
+        console.print("  Install it:  sbake whisper install")
+        raise typer.Exit(code=1)
+
+    installed = installer.installed_version()
+    label = installed if installed else "system PATH"
+    binary = installer.ensure_available()
+    console.print(f"[bold green]whisper.cpp:[/bold green] {label}")
+    console.print(f"  binary: {binary}")
+
+
+@whisper_app.command("update")
+def whisper_update() -> None:
+    """Update whisper.cpp to the latest version."""
+    from subbake.whisper_installer import WhisperInstaller
+
+    try:
+        installer = WhisperInstaller(project_root=Path.cwd())
+        with _download_progress("whisper.cpp") as progress:
+            binary = installer.update(progress_callback=progress)
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[bold green]Updated:[/bold green] {binary}")
+
+
+@whisper_app.command("list")
+def whisper_list() -> None:
+    """List installed whisper.cpp versions and downloaded models."""
+    from subbake.whisper_installer import WhisperInstaller
+
+    installer = WhisperInstaller(project_root=Path.cwd())
+
+    versions = installer.list_versions()
+    if versions:
+        console.print("[bold green]Installed versions:[/bold green]")
+        for v in versions:
+            console.print(f"  - {v}")
+    else:
+        console.print("[bold yellow]No versions installed.[/bold yellow]")
+
+    models = installer.list_models()
+    if models:
+        console.print("[bold green]Downloaded models:[/bold green]")
+        for m in models:
+            size = m.get("size_mb", "?")
+            console.print(f"  - {m['name']} ({size} MB)")
+    else:
+        console.print("[bold yellow]No models downloaded.[/bold yellow]")
+
+    console.print(f"[dim]Binary path: {installer.binary_path}[/dim]")
+
+
+@whisper_app.command("uninstall")
+def whisper_uninstall(
+    keep_models: bool = typer.Option(
+        False,
+        "--keep-models",
+        help="Keep downloaded models when uninstalling.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Skip confirmation prompt.",
+    ),
+) -> None:
+    """Remove whisper.cpp binary and optionally models."""
+    from subbake.whisper_installer import WhisperInstaller
+
+    if not force:
+        scope = "the managed whisper.cpp binary" if keep_models else "whisper.cpp and all downloaded models"
+        answer = console.input(
+            f"[bold yellow]This will remove {scope}."
+            " Continue? [y/N]: [/bold yellow]"
+        )
+        if answer.strip().lower() != "y":
+            console.print("[bold yellow]Aborted.[/bold yellow]")
+            raise typer.Exit()
+
+    try:
+        installer = WhisperInstaller(project_root=Path.cwd())
+        installer.uninstall(keep_models=keep_models)
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@whisper_app.command("models")
+def whisper_models(
+    list_only: bool = typer.Option(
+        False,
+        "--list",
+        help="Only list models, don't manage.",
+    ),
+    remove: str | None = typer.Option(
+        None,
+        "--remove",
+        help="Remove a specific model by name (e.g. small, medium).",
+    ),
+    download: str | None = typer.Option(
+        None,
+        "--download",
+        help="Download a specific model by name: tiny/base/small/medium/large-v3.",
+    ),
+) -> None:
+    """List and manage downloaded GGML models."""
+    from subbake.whisper_installer import SUPPORTED_MODELS, WhisperInstaller
+
+    installer = WhisperInstaller(project_root=Path.cwd())
+
+    if download:
+        try:
+            with _download_progress(f"ggml-{download}.bin") as progress:
+                model_path = installer.download_model(download, progress_callback=progress)
+        except Exception as exc:
+            console.print(f"[bold red]Error:[/bold red] {exc}")
+            raise typer.Exit(code=1) from exc
+        console.print(f"[bold green]Model:[/bold green] {model_path}")
+        return
+
+    if list_only or (remove is None and not list_only):
+        models = installer.list_models()
+        console.print("[bold green]Available models:[/bold green]")
+        for name in sorted(SUPPORTED_MODELS):
+            downloaded = "✓" if any(m["name"] == name for m in models) else " "
+            size = next((m.get("size_mb", "?") for m in models if m["name"] == name), "—")
+            console.print(f"  [{downloaded}] {name} ({size} MB)")
+        return
+
+    if remove:
+        installer.remove_model(remove)
 def _resolve_clean_paths(
     target: Path,
     work_dir: Path | None,

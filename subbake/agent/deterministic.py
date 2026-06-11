@@ -6,6 +6,7 @@ that maps common user requests directly to tool calls without LLM.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +15,8 @@ if TYPE_CHECKING:
 
 from .arg_parser import series_suffixes_from_text, translation_arguments_from_text
 from .text_helpers import content_after_references, extract_references, search_pattern_from_text
+
+WHISPER_MODEL_NAMES = ("large-v3", "medium", "small", "base", "tiny")
 
 
 def deterministic_decision_from_line(agent: SubBakeAgent, line: str) -> dict[str, Any] | None:
@@ -34,6 +37,20 @@ def deterministic_decision_from_line(agent: SubBakeAgent, line: str) -> dict[str
             "tool_name": tool_name,
             "arguments": arguments,
         }
+
+    whisper_request = manage_whisper_request(line)
+    if whisper_request is not None:
+        action = str(whisper_request["action"])
+        messages = {
+            "install": "Preparing to install whisper.cpp.",
+            "download_model": "Downloading whisper.cpp model.",
+            "update": "Preparing to update whisper.cpp.",
+            "uninstall": "Preparing to uninstall whisper.cpp.",
+            "status": "Checking whisper.cpp status.",
+        }
+        if action == "download_model":
+            messages[action] = f"Download whisper.cpp model `{whisper_request.get('model', 'small')}`."
+        return decision("manage_whisper", whisper_request, messages.get(action, "Managing whisper.cpp."))
 
     if any(word in lowered for word in ("删除", "delete", "remove")) and len(references) == 1:
         return decision("delete_file", {"path": str(references[0])}, "Deleting file.")
@@ -118,3 +135,68 @@ def directory_series_request(agent: SubBakeAgent, line: str, references: list[Pa
         arguments["suffixes"] = sorted(suffixes)
     arguments.update(translation_arguments_from_text(line))
     return arguments
+
+
+def manage_whisper_request(line: str) -> dict[str, Any] | None:
+    lowered = line.casefold()
+    mentions_whisper = any(token in lowered for token in ("whisper", "whisper.cpp", "whisper cpp"))
+    mentions_model_name = _whisper_model_name_in_text(line) is not None
+    mentions_model_download = (
+        mentions_model_name
+        and any(word in lowered for word in ("下载", "download"))
+        and not any(word in lowered for word in ("字幕", "subtitle", "文件", "file"))
+    )
+    if not mentions_whisper and not mentions_model_download:
+        return None
+
+    action: str | None = None
+    if any(word in lowered for word in ("状态", "查看", "检查", "status", "version", "版本")):
+        action = "status"
+    elif any(word in lowered for word in ("更新", "升级", "update", "upgrade")):
+        action = "update"
+    elif any(word in lowered for word in ("卸载", "移除", "删除", "uninstall", "remove")):
+        action = "uninstall"
+    elif mentions_model_download or (
+        any(word in lowered for word in ("下载", "download"))
+        and any(word in lowered for word in ("模型", "model"))
+        and not any(word in lowered for word in ("安装", "接入", "setup", "install"))
+    ):
+        action = "download_model"
+    elif any(word in lowered for word in ("安装", "下载", "接入", "install", "download", "setup")):
+        action = "install"
+
+    if action is None:
+        return None
+
+    arguments: dict[str, Any] = {"action": action}
+    if action == "install":
+        arguments["version"] = _whisper_version_from_text(line)
+    if action in {"install", "download_model"}:
+        arguments["model"] = _whisper_model_from_text(line)
+    if action == "uninstall":
+        arguments["keep_models"] = any(
+            phrase in lowered
+            for phrase in ("保留模型", "保留 model", "保留 models", "keep model", "keep models")
+        )
+    return arguments
+
+
+def _whisper_model_from_text(line: str) -> str:
+    return _whisper_model_name_in_text(line) or "small"
+
+
+def _whisper_model_name_in_text(line: str) -> str | None:
+    lowered = line.casefold()
+    for model in WHISPER_MODEL_NAMES:
+        if model in lowered:
+            return model
+    return None
+
+
+def _whisper_version_from_text(line: str) -> str:
+    match = re.search(r"\bv\d+(?:\.\d+)+(?:[-._a-zA-Z0-9]*)?\b", line)
+    if match:
+        return match.group(0)
+    if re.search(r"\blatest\b", line, flags=re.IGNORECASE) or "最新版" in line or "最新" in line:
+        return "latest"
+    return "latest"

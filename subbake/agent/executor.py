@@ -10,16 +10,19 @@ from __future__ import annotations
 import hashlib
 import shutil
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TimeRemainingColumn, TransferSpeedColumn
 
 if TYPE_CHECKING:
     from ._core import SubBakeAgent
 
 from subbake.editing import edit_generated_subtitle as _edit_generated_subtitle, is_generated_subtitle
 from subbake.pipeline import SubtitlePipeline
-from subbake.runtime_options import build_pipeline_options
+from subbake.runtime_options import build_pipeline_options, build_transcriber_from_values
 from subbake.series import (
     discover_series_files,
     resolve_series_output_path,
@@ -27,6 +30,25 @@ from subbake.series import (
 )
 from subbake.ui import Dashboard
 from subbake import runtime_options as _runtime_options
+
+
+@contextmanager
+def _download_progress(agent: SubBakeAgent, label: str):
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=agent.console,
+    )
+    with progress:
+        task_id = progress.add_task(label, total=None)
+
+        def update(downloaded: int, total: int) -> None:
+            progress.update(task_id, total=total, completed=downloaded)
+
+        yield update
 
 
 def translate_file(
@@ -375,3 +397,186 @@ def _format_tokens(count: int) -> str:
     if count >= 1_000:
         return f"{count / 1_000:.0f}K"
     return str(count)
+
+
+def transcribe_file(
+    agent: SubBakeAgent,
+    path: Path,
+    *,
+    original: str,
+    arguments: dict[str, Any] | None = None,
+) -> None:
+    """Transcribe an audio/video file to subtitles and record the operation."""
+    from subbake.transcriber import is_media_file, transcribe_to_srt
+
+    if not path.exists():
+        raise FileNotFoundError(f"Media file not found: {path}")
+    if not is_media_file(path):
+        raise ValueError(
+            f"Unsupported file type: {path.suffix}. "
+            "Supported: audio (wav/mp3/m4a/...) or video (mp4/mkv/...)"
+        )
+
+    values = agent._translation_values_for_tool(arguments or {})
+    dry_run = bool(values.get("dry_run", False))
+
+    agent.console.print(
+        f"[bold green]Transcribing:[/bold green] {path.name}"
+    )
+
+    if dry_run:
+        agent.console.print(
+            f"[bold yellow]Dry run:[/bold yellow] would transcribe {path.name}"
+        )
+        agent._record_event(
+            "transcribe_file", original,
+            {
+                "input_path": str(path),
+                "dry_run": True,
+                "summary": f"规划了转录 {path.name}",
+            },
+        )
+        agent._record_event(
+            "assistant", f"已规划转录 {path.name}。",
+            {"decision": "tool_call", "tool": "transcribe_audio"},
+        )
+        return
+
+    provider = str(values.get("transcriber", "whisper_api"))
+    output_format = str(arguments.get("output_format") or values.get("output_format") or "srt")
+    language = str(arguments["language"]) if arguments and arguments.get("language") else None
+
+    try:
+        output_path = transcribe_to_srt(
+            path,
+            project_root=agent.project_root,
+            provider=provider,
+            api_key=values.get("api_key"),
+            base_url=values.get("base_url"),
+            model=values.get("whisper_api_model"),
+            whisper_model=values.get("whisper_model", "small"),
+            language=language,
+            output_format=output_format,
+        )
+    except Exception as exc:
+        agent.console.print(f"[bold red]Transcription error:[/bold red] {exc}")
+        agent._record_event(
+            "transcribe_file", original,
+            {
+                "input_path": str(path),
+                "error": str(exc),
+                "summary": f"转录 {path.name} 失败：{exc}",
+            },
+        )
+        return
+
+    agent.console.print(f"[bold green]Transcribed:[/bold green] {output_path}")
+    agent._record_event(
+        "transcribe_file", original,
+        {
+            "input_path": str(path),
+            "output_path": str(output_path),
+            "transcriber": provider,
+            "output_format": output_format,
+            "language": language,
+            "summary": f"转录了 {path.name} → {output_path.name}",
+        },
+    )
+    agent._record_event(
+        "assistant", f"已完成转录，输出 {output_path}。",
+        {"decision": "tool_call", "tool": "transcribe_audio"},
+    )
+
+
+def manage_whisper(
+    agent: SubBakeAgent,
+    *,
+    original: str,
+    arguments: dict[str, Any] | None = None,
+) -> None:
+    """Manage whisper.cpp installation from the agent (install/update/uninstall/status)."""
+    from subbake.whisper_installer import WhisperInstaller
+
+    action = str((arguments or {}).get("action", "")).strip()
+    version = str((arguments or {}).get("version", "latest")).strip()
+    model = str((arguments or {}).get("model", "small")).strip()
+    keep_models = bool((arguments or {}).get("keep_models", False))
+
+    installer = WhisperInstaller(project_root=agent.project_root)
+
+    if action == "status":
+        ok, msg = installer.check_available()
+        if ok:
+            ver = installer.installed_version() or "?"
+            agent.console.print(f"[bold green]whisper.cpp {ver} is available[/bold green]")
+            models = installer.list_models()
+            if models:
+                agent.console.print("  [dim]Models:[/dim] " + ", ".join(m["name"] for m in models))
+        else:
+            agent.console.print(f"[bold yellow]{msg}[/bold yellow]")
+        agent._record_event(
+            "manage_whisper", original,
+            {"action": "status", "summary": f"Whisper status checked: {'available' if ok else 'not installed'}"},
+        )
+        return
+
+    if action == "install":
+        try:
+            ok, _ = installer.check_available()
+            if ok:
+                binary = installer.ensure_available()
+                agent.console.print(f"[bold green]whisper.cpp already available:[/bold green] {binary}")
+            else:
+                agent.console.print("[bold green]Installing whisper.cpp...[/bold green]")
+                with _download_progress(agent, "whisper.cpp") as progress:
+                    binary = installer.install(version=version, progress_callback=progress)
+            with _download_progress(agent, f"ggml-{model}.bin") as progress:
+                model_path = installer.download_model(model=model, progress_callback=progress)
+            agent.console.print(f"[bold green]Installed:[/bold green] {binary}")
+            agent.console.print(f"[bold green]Model:[/bold green] {model_path}")
+        except Exception as exc:
+            agent.console.print(f"[bold red]Install error:[/bold red] {exc}")
+        agent._record_event(
+            "manage_whisper", original,
+            {"action": "install", "version": version, "model": model},
+        )
+        return
+
+    if action == "download_model":
+        try:
+            agent.console.print(f"[bold green]Downloading model:[/bold green] {model}")
+            with _download_progress(agent, f"ggml-{model}.bin") as progress:
+                model_path = installer.download_model(model=model, progress_callback=progress)
+            agent.console.print(f"[bold green]Model:[/bold green] {model_path}")
+        except Exception as exc:
+            agent.console.print(f"[bold red]Model download error:[/bold red] {exc}")
+        agent._record_event(
+            "manage_whisper", original,
+            {"action": "download_model", "model": model},
+        )
+        return
+
+    if action == "update":
+        try:
+            agent.console.print("[bold green]Updating whisper.cpp...[/bold green]")
+            with _download_progress(agent, "whisper.cpp") as progress:
+                binary = installer.update(progress_callback=progress)
+            agent.console.print(f"[bold green]Updated:[/bold green] {binary}")
+        except Exception as exc:
+            agent.console.print(f"[bold red]Update error:[/bold red] {exc}")
+        agent._record_event(
+            "manage_whisper", original,
+            {"action": "update"},
+        )
+        return
+
+    if action == "uninstall":
+        installer.uninstall(keep_models=keep_models)
+        agent.console.print("[bold green]whisper.cpp has been uninstalled.[/bold green]")
+        agent._record_event(
+            "manage_whisper", original,
+            {"action": "uninstall", "keep_models": keep_models},
+        )
+        return
+
+    agent.console.print(f"[bold yellow]Unknown manage_whisper action: {action}[/bold yellow]")

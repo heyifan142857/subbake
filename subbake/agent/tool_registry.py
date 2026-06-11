@@ -10,6 +10,8 @@ from typing import Any
 TOOL_CATEGORIES: dict[str, list[str]] = {
     "translate_file": ["translate_file"],
     "translate_series": ["translate_series"],
+    "transcribe": ["transcribe_audio"],
+    "manage_whisper": ["manage_whisper"],
     "edit_subtitle": ["edit_subtitle"],
     "diagnose": ["diagnose_path", "diagnose_text"],
     "file_operation": ["create_file", "append_file", "replace_in_file", "rename_path", "delete_file"],
@@ -21,6 +23,52 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
 ALWAYS_AVAILABLE_TOOLS: tuple[str, ...] = (
     "list_files", "search_files", "read_file_preview", "recent_translations", "candidate_subtitles",
 )
+
+_TRANSCRIBE_AUDIO_SPEC: dict[str, Any] = {
+    "name": "transcribe_audio",
+    "mutating": True,
+    "category": "transcribe",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the audio or video file to transcribe."},
+            "transcriber": {"type": "string", "description": "Transcription provider: whisper_api or whisper_cpp.", "enum": ["whisper_api", "whisper_cpp"]},
+            "language": {"type": "string", "description": "Source language hint (e.g., 'en', 'zh', 'ja')."},
+            "output_format": {"type": "string", "description": "Output format: srt, vtt, or txt.", "enum": ["srt", "vtt", "txt"]},
+            "dry_run": {"type": "boolean", "description": "Only plan without calling the transcription API."},
+        },
+        "required": ["path"],
+    },
+}
+
+_MANAGE_WHISPER_SPEC: dict[str, Any] = {
+    "name": "manage_whisper",
+    "mutating": True,
+    "category": "manage_whisper",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "description": "Action to perform: install, download_model, update, uninstall, status. install/download_model/update/uninstall require user approval with /approve.",
+                "enum": ["install", "download_model", "update", "uninstall", "status"],
+            },
+            "version": {
+                "type": "string",
+                "description": "Version to install (e.g. 'latest' or 'v1.7.0'). Default: latest.",
+            },
+            "model": {
+                "type": "string",
+                "description": "GGML model to download. Default: small.",
+            },
+            "keep_models": {
+                "type": "boolean",
+                "description": "When uninstalling, keep downloaded GGML model files.",
+            },
+        },
+        "required": ["action"],
+    },
+}
 
 ALL_TOOL_SPECS: list[dict[str, Any]] = [
     {
@@ -258,6 +306,8 @@ ALL_TOOL_SPECS: list[dict[str, Any]] = [
             "required": ["profile"],
         },
     },
+    _TRANSCRIBE_AUDIO_SPEC,
+    _MANAGE_WHISPER_SPEC,
 ]
 
 

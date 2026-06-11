@@ -22,12 +22,19 @@ MUTATING_TOOL_NAMES = frozenset(
     {
         "translate_file",
         "translate_series",
+        "transcribe_audio",
+        "manage_whisper",
         "edit_subtitle",
         "create_file",
         "append_file",
         "replace_in_file",
         "rename_path",
         "delete_file",
+    }
+)
+APPROVAL_REQUIRED_TOOL_NAMES = frozenset(
+    {
+        "manage_whisper",
     }
 )
 GENERATED_SUBTITLE_MARKERS = (".translated.", ".bilingual.")

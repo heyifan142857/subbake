@@ -98,6 +98,18 @@ def print_tool_call_preview(console: Console, call: dict[str, Any]) -> None:
         instruction = str(arguments.get("instruction") or "")
         if instruction:
             console.print(f"  instruction: {instruction}")
+    elif tool_name == "manage_whisper":
+        action = str(arguments.get("action") or "")
+        version = str(arguments.get("version") or "")
+        model = str(arguments.get("model") or "")
+        if action:
+            console.print(f"  action: {action}")
+        if version:
+            console.print(f"  version: {version}")
+        if model:
+            console.print(f"  model: {model}")
+        if arguments.get("keep_models"):
+            console.print("  keep models: true")
     elif tool_name in {"translate_file", "translate_series"}:
         _print_translation_options(console, arguments)
 

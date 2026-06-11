@@ -7,7 +7,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from click.core import ParameterSource
 from prompt_toolkit.document import Document
@@ -1213,6 +1213,167 @@ class CLITestCase(unittest.TestCase):
             self.assertIn("<proposed_plan>", output)
             self.assertIn("Use /approve", output)
 
+    def test_agent_whisper_install_requires_approval_in_chat_mode(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n',
+                encoding="utf-8",
+            )
+            with patch("subbake.whisper_installer.WhisperInstaller.install") as install:
+                result = self.runner.invoke(app, [], input="安装 whisper.cpp small 模型\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertFalse(install.called)
+            self.assertIn("<proposed_plan>", output)
+            self.assertIn("manage_whisper", output)
+            self.assertIn("Use /approve", output)
+
+    def test_agent_whisper_install_runs_after_approval(self) -> None:
+        with self._isolated_filesystem():
+            root = Path.cwd()
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n',
+                encoding="utf-8",
+            )
+            binary = root / ".subbake" / "whisper" / "bin" / "whisper-cli"
+            model_path = root / ".subbake" / "whisper" / "models" / "ggml-small.bin"
+            with patch("subbake.whisper_installer.WhisperInstaller.check_available", return_value=(False, "not installed")):
+                with patch("subbake.whisper_installer.WhisperInstaller.install", return_value=binary) as install:
+                    with patch("subbake.whisper_installer.WhisperInstaller.download_model", return_value=model_path) as download_model:
+                        result = self.runner.invoke(app, [], input="安装 whisper.cpp small 模型\n/approve\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            install.assert_called_once_with(version="latest", progress_callback=ANY)
+            download_model.assert_called_once_with(model="small", progress_callback=ANY)
+            self.assertIn("<proposed_plan>", output)
+            self.assertIn("Installed:", output)
+
+    def test_agent_whisper_install_skips_binary_when_available(self) -> None:
+        with self._isolated_filesystem():
+            root = Path.cwd()
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n',
+                encoding="utf-8",
+            )
+            binary = root / ".subbake" / "whisper" / "bin" / "whisper-cli"
+            model_path = root / ".subbake" / "whisper" / "models" / "ggml-tiny.bin"
+            with patch("subbake.whisper_installer.WhisperInstaller.check_available", return_value=(True, "ok")):
+                with patch("subbake.whisper_installer.WhisperInstaller.ensure_available", return_value=binary):
+                    with patch("subbake.whisper_installer.WhisperInstaller.install") as install:
+                        with patch("subbake.whisper_installer.WhisperInstaller.download_model", return_value=model_path) as download_model:
+                            result = self.runner.invoke(app, [], input="安装 whisper.cpp tiny 模型\n/approve\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertFalse(install.called)
+            download_model.assert_called_once_with(model="tiny", progress_callback=ANY)
+            self.assertIn("whisper.cpp already available", output)
+
+    def test_agent_whisper_download_model_runs_after_approval(self) -> None:
+        with self._isolated_filesystem():
+            root = Path.cwd()
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n',
+                encoding="utf-8",
+            )
+            model_path = root / ".subbake" / "whisper" / "models" / "ggml-medium.bin"
+            with patch("subbake.whisper_installer.WhisperInstaller.download_model", return_value=model_path) as download_model:
+                result = self.runner.invoke(app, [], input="下载 whisper.cpp medium 模型\n/approve\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            download_model.assert_called_once_with(model="medium", progress_callback=ANY)
+            self.assertIn("<proposed_plan>", output)
+            self.assertIn("Model:", output)
+
+    def test_agent_download_tiny_without_whisper_keyword_uses_download_model(self) -> None:
+        with self._isolated_filesystem():
+            root = Path.cwd()
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n',
+                encoding="utf-8",
+            )
+            model_path = root / ".subbake" / "whisper" / "models" / "ggml-tiny.bin"
+            with patch("subbake.whisper_installer.WhisperInstaller.download_model", return_value=model_path) as download_model:
+                result = self.runner.invoke(app, [], input="帮我下载tiny\n/approve\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            download_model.assert_called_once_with(model="tiny", progress_callback=ANY)
+            self.assertIn("Download whisper.cpp model `tiny`.", output)
+            self.assertIn("action: download_model", output)
+
+    def test_whisper_models_download_command_downloads_selected_model(self) -> None:
+        with self._isolated_filesystem():
+            model_path = Path.cwd() / ".subbake" / "whisper" / "models" / "ggml-base.bin"
+            with patch("subbake.whisper_installer.WhisperInstaller.download_model", return_value=model_path) as download_model:
+                result = self.runner.invoke(app, ["whisper", "models", "--download", "base"])
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            download_model.assert_called_once_with("base", progress_callback=ANY)
+            self.assertIn("Model:", output)
+
+    def test_whisper_install_command_skips_binary_when_available(self) -> None:
+        with self._isolated_filesystem():
+            binary = Path.cwd() / ".subbake" / "whisper" / "bin" / "whisper-cli"
+            model_path = Path.cwd() / ".subbake" / "whisper" / "models" / "ggml-tiny.bin"
+            with patch("subbake.whisper_installer.WhisperInstaller.check_available", return_value=(True, "ok")):
+                with patch("subbake.whisper_installer.WhisperInstaller.ensure_available", return_value=binary):
+                    with patch("subbake.whisper_installer.WhisperInstaller.install") as install:
+                        with patch("subbake.whisper_installer.WhisperInstaller.download_model", return_value=model_path) as download_model:
+                            result = self.runner.invoke(app, ["whisper", "install", "--model", "tiny"])
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertFalse(install.called)
+            download_model.assert_called_once_with(model="tiny", progress_callback=ANY)
+            self.assertIn("whisper.cpp already available", output)
+
+    def test_agent_whisper_status_does_not_require_approval(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n',
+                encoding="utf-8",
+            )
+            with patch("subbake.whisper_installer.WhisperInstaller.check_available", return_value=(False, "not installed")):
+                result = self.runner.invoke(app, [], input="查看 whisper.cpp 状态\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertNotIn("<proposed_plan>", output)
+            self.assertIn("not installed", output)
+
+    def test_agent_whisper_uninstall_keep_models_runs_after_approval(self) -> None:
+        with self._isolated_filesystem():
+            Path("subbake.toml").write_text(
+                "[defaults]\n"
+                'provider = "mock"\n'
+                'model = "mock-zh"\n',
+                encoding="utf-8",
+            )
+            with patch("subbake.whisper_installer.WhisperInstaller.uninstall") as uninstall:
+                result = self.runner.invoke(app, [], input="卸载 whisper.cpp 保留模型\n/approve\n/exit\n")
+            output = self._strip_ansi(result.stdout)
+
+            self.assertEqual(result.exit_code, 0)
+            uninstall.assert_called_once_with(keep_models=True)
+            self.assertIn("keep models: true", output)
+
     def test_agent_reject_discards_pending_plan(self) -> None:
         with self._isolated_filesystem():
             Path("subbake.toml").write_text(
@@ -1235,3 +1396,55 @@ class CLITestCase(unittest.TestCase):
 
     def _strip_ansi(self, value: str) -> str:
         return re.sub(r"\x1b\[[0-9;]*m", "", value)
+
+
+class TestTranscribeCommand(unittest.TestCase):
+    """Test the ``sbake transcribe`` CLI command."""
+
+    def setUp(self) -> None:
+        self.runner = CliRunner()
+
+    def test_transcribe_dry_run(self) -> None:
+        with self._isolated_filesystem():
+            Path("test.mp4").write_text("fake video content", encoding="utf-8")
+            result = self.runner.invoke(
+                app,
+                ["transcribe", "test.mp4", "--dry-run"],
+            )
+            output = self._strip_ansi(result.stdout)
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Dry run", output)
+            self.assertIn("test.mp4", output)
+
+    def test_transcribe_unsupported_format(self) -> None:
+        with self._isolated_filesystem():
+            Path("test.pdf").write_text("fake", encoding="utf-8")
+            result = self.runner.invoke(
+                app,
+                ["transcribe", "test.pdf"],
+            )
+            self.assertNotEqual(result.exit_code, 0)
+
+    def test_transcribe_with_output_option(self) -> None:
+        with self._isolated_filesystem():
+            Path("test.mp4").write_text("fake", encoding="utf-8")
+            result = self.runner.invoke(
+                app,
+                ["transcribe", "test.mp4", "-o", "custom.srt", "--dry-run"],
+            )
+            output = self._strip_ansi(result.stdout)
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("test.mp4", output)
+
+    def test_transcribe_help(self) -> None:
+        result = self.runner.invoke(app, ["transcribe", "--help"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("Transcribe audio/video", result.stdout)
+
+    @staticmethod
+    def _strip_ansi(value: str) -> str:
+        return re.sub(r"\x1b\[[0-9;]*m", "", value)
+
+    @staticmethod
+    def _isolated_filesystem():
+        return CliRunner().isolated_filesystem()

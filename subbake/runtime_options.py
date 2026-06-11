@@ -30,6 +30,12 @@ DEFAULT_TRANSLATION_VALUES: dict[str, Any] = {
     "agent_repair_attempts": 2,
     "work_dir": None,
     "glossary_path": None,
+    # Transcription defaults
+    "transcriber": "whisper_api",
+    "whisper_model": "small",
+    "whisper_version": "latest",
+    "whisper_bin_dir": None,
+    "whisper_api_model": "whisper-1",
 }
 
 
@@ -105,3 +111,18 @@ def _optional_path(value: object) -> Path | None:
     if isinstance(value, Path):
         return value
     return Path(str(value))
+
+
+def build_transcriber_from_values(values: dict[str, Any], *, project_root: Path) -> "TranscriberBackend":
+    """Build a TranscriberBackend from translation/transcription values."""
+    from subbake.transcriber import build_transcriber
+
+    return build_transcriber(
+        provider=str(values.get("transcriber", "whisper_api")),
+        project_root=project_root,
+        api_key=_optional_string(values.get("api_key")),
+        base_url=_optional_string(values.get("base_url")),
+        model=_optional_string(values.get("whisper_api_model")),
+        whisper_model=str(values.get("whisper_model", "small")),
+        timeout_seconds=float(values.get("timeout", 300.0)),
+    )

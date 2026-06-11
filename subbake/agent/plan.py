@@ -22,6 +22,7 @@ from .trace import (
 INTERRUPT_SENTINEL = "__subbake_interrupted__"
 # Sentinel returned when the user presses Ctrl+C to exit.
 EXIT_SENTINEL = "__subbake_exit__"
+APPROVAL_REQUIRED_TOOL_NAMES = frozenset({"manage_whisper"})
 from .ui import print_tool_call_preview
 
 
@@ -54,9 +55,13 @@ def approve_pending_plan(agent: SubBakeAgent) -> None:
         agent.session.pending_plan = None
         return
     for call in tool_calls:
+        tool_name = str(call.get("tool_name") or "")
+        arguments = dict(call.get("arguments") or {})
+        if tool_name in APPROVAL_REQUIRED_TOOL_NAMES:
+            arguments["_approved"] = True
         result = agent._run_tool_call(
-            str(call.get("tool_name") or ""),
-            dict(call.get("arguments") or {}),
+            tool_name,
+            arguments,
             original=str(plan.get("original") or "/approve"),
         )
         if result:

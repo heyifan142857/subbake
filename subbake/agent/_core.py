@@ -12,6 +12,7 @@ from rich.text import Text
 
 from subbake import __version__
 from .loop import (
+    APPROVAL_REQUIRED_TOOL_NAMES,
     DISCOVERY_TOOL_NAMES,
     AgentLoopState,
     AgentLoopStep,
@@ -545,7 +546,11 @@ class SubBakeAgent:
             dict(decision.get("arguments") or {}),
             original=original,
         )
-        message = str(decision.get("message") or decision.get("reason") or "Executing tool.").strip()
+        message = self._tool_plan_message(
+            tool_name,
+            arguments,
+            fallback=str(decision.get("message") or decision.get("reason") or "Executing tool.").strip(),
+        )
         if self.session.mode == "plan":
             return {
                 "action": "plan",
@@ -588,6 +593,11 @@ class SubBakeAgent:
                 series=True,
                 user_message=original,
             )
+        if tool_name == "manage_whisper":
+            from .deterministic import manage_whisper_request
+            parsed = manage_whisper_request(original)
+            if parsed is not None:
+                enriched.update(parsed)
         return enriched
 
     def _handle_decision(self, decision: dict[str, Any], *, original: str) -> None:
@@ -626,6 +636,21 @@ class SubBakeAgent:
                 return
             tool_name = str(decision.get("tool_name") or "")
             arguments = dict(decision.get("arguments") or {})
+            if self._tool_requires_approval(tool_name, arguments):
+                _store_plan(self,
+                    {
+                        "action": "plan",
+                        "message": decision.get("message") or "Approval required for this tool action.",
+                        "tool_calls": [
+                            {
+                                "tool_name": tool_name,
+                                "arguments": arguments,
+                            }
+                        ],
+                    },
+                    original=original,
+                )
+                return
             message = str(decision.get("message") or "").strip()
             if message and not self._tool_prints_own_progress(tool_name):
                 self.console.print(message)
@@ -657,6 +682,15 @@ class SubBakeAgent:
                 suffixes=self._series_suffixes_from_argument(arguments.get("suffixes")),
                 arguments=arguments,
             )
+            return ""
+        if tool_name == "transcribe_audio":
+            path = self._resolve_user_path(str(arguments.get("path") or ""))
+            from .executor import transcribe_file as _exec_transcribe_file
+            _exec_transcribe_file(self, path, original=original, arguments=arguments)
+            return ""
+        if tool_name == "manage_whisper":
+            from .executor import manage_whisper as _exec_manage_whisper
+            _exec_manage_whisper(self, original=original, arguments=arguments)
             return ""
         if tool_name == "diagnose_path":
             path = self._resolve_user_path(str(arguments.get("path") or ""))
@@ -739,7 +773,33 @@ class SubBakeAgent:
         raise ValueError(f"Unsupported agent tool: {tool_name or '<missing>'}")
 
     def _tool_prints_own_progress(self, tool_name: str) -> bool:
-        return tool_name in {"translate_file", "translate_series"}
+        return tool_name in {"translate_file", "translate_series", "transcribe_audio"}
+
+    def _tool_requires_approval(self, tool_name: str, arguments: dict[str, Any]) -> bool:
+        if tool_name not in APPROVAL_REQUIRED_TOOL_NAMES:
+            return False
+        if tool_name == "manage_whisper":
+            action = str(arguments.get("action") or "").strip()
+            if action not in {"install", "download_model", "update", "uninstall"}:
+                return False
+        return not bool(arguments.pop("_approved", False))
+
+    def _tool_plan_message(self, tool_name: str, arguments: dict[str, Any], *, fallback: str) -> str:
+        if tool_name == "manage_whisper":
+            action = str(arguments.get("action") or "").strip()
+            model = str(arguments.get("model") or "small").strip()
+            version = str(arguments.get("version") or "latest").strip()
+            if action == "download_model":
+                return f"Download whisper.cpp model `{model}`."
+            if action == "install":
+                return f"Install whisper.cpp `{version}` and download model `{model}`."
+            if action == "update":
+                return "Update whisper.cpp to the latest version."
+            if action == "uninstall":
+                return "Uninstall managed whisper.cpp files."
+            if action == "status":
+                return "Check whisper.cpp status."
+        return fallback
 
     def _record_file_op_event(self, result: FileOpResult, original: str) -> None:
         self._record_event(

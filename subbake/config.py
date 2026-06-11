@@ -32,9 +32,24 @@ TRANSLATE_CONFIG_KEYS = COMMON_CONFIG_KEYS | {
     "agent_repair_attempts",
     "work_dir",
     "glossary_path",
+    # Transcription (used when translating video files)
+    "transcriber",
+    "whisper_model",
+    "whisper_version",
+    "whisper_bin_dir",
+    "whisper_api_model",
 }
 CHECK_KEY_CONFIG_KEYS = set(COMMON_CONFIG_KEYS)
-_PATH_KEYS = {"work_dir", "glossary_path"}
+TRANSCRIBE_CONFIG_KEYS = {
+    "transcriber",
+    "whisper_model",
+    "whisper_version",
+    "whisper_bin_dir",
+    "whisper_api_model",
+    "output_format",
+    "dry_run",
+}
+_PATH_KEYS = {"work_dir", "glossary_path", "whisper_bin_dir"}
 _BOOL_KEYS = {"fast", "bilingual", "final_review", "dry_run", "resume", "cache", "agent"}
 _INT_KEYS = {"batch_size", "retries", "agent_repair_attempts"}
 _FLOAT_KEYS = {"timeout"}

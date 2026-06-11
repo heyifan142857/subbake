@@ -27,7 +27,7 @@ CONFIDENCE_MIN_OBSERVATIONS = 2
 
 VALID_INTENT_CATEGORIES = frozenset({
     "translate_file", "translate_series", "edit_subtitle",
-    "diagnose", "file_operation", "browse", "profile", "chat",
+    "diagnose", "file_operation", "browse", "profile", "manage_whisper", "chat",
 })
 
 
@@ -59,6 +59,7 @@ def classify_intent(
         "- file_operation: Create, append, replace, rename, or delete files\n"
         "- browse: List, search, or read files\n"
         "- profile: Switch or list model profiles\n"
+        "- manage_whisper: Install, update, uninstall, or check local whisper.cpp\n"
         "- chat: General conversation, no tool needed\n\n"
         "Return JSON only with: category, confidence (0-1), parameters (dict), and reason.\n"
         "Extract file paths, language names, format preferences from natural language."
@@ -192,10 +193,10 @@ def intent_to_decision(
 def _prepopulate_args_from_intent_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     """Convert intent-extracted parameters into tool argument format."""
     args: dict[str, Any] = {}
-    for key in ("path", "target_language", "source_language", "output_format", "pattern", "query", "content", "old", "new", "old_path", "new_path", "instruction", "text"):
+    for key in ("path", "target_language", "source_language", "output_format", "pattern", "query", "content", "old", "new", "old_path", "new_path", "instruction", "text", "action", "version", "model"):
         if key in parameters:
             args[key] = parameters[key]
-    for key in ("bilingual", "recursive", "overwrite", "dry_run", "fast", "final_review"):
+    for key in ("bilingual", "recursive", "overwrite", "dry_run", "fast", "final_review", "keep_models"):
         if key in parameters:
             args[key] = bool(parameters[key])
     return args
@@ -208,6 +209,8 @@ def _has_required_args(category: str, args: dict[str, Any]) -> bool:
         return "path" in args and "instruction" in args
     if category == "translate_series":
         return "path" in args
+    if category == "manage_whisper":
+        return args.get("action") in {"install", "download_model", "update", "uninstall", "status"}
     return False
 
 
@@ -220,6 +223,7 @@ def _category_to_default_tool(category: str) -> str:
         "file_operation": "create_file",
         "browse": "list_files",
         "profile": "list_profiles",
+        "manage_whisper": "manage_whisper",
     }
     return mapping.get(category, "list_files")
 
