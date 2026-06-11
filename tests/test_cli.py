@@ -1445,6 +1445,12 @@ class TestTranscribeCommand(unittest.TestCase):
     def _strip_ansi(value: str) -> str:
         return re.sub(r"\x1b\[[0-9;]*m", "", value)
 
-    @staticmethod
-    def _isolated_filesystem():
-        return CliRunner().isolated_filesystem()
+    @contextlib.contextmanager
+    def _isolated_filesystem(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                yield tmpdir
+            finally:
+                os.chdir(old_cwd)
